@@ -5,11 +5,36 @@ import inflect
 from wetext import Normalizer
 
 chinese_char_pattern = re.compile(r"[\u4e00-\u9fff]+")
+khmer_char_pattern = re.compile(r"[\u1780-\u17ff]")
+thai_char_pattern = re.compile(r"[\u0e00-\u0e7f]")
 
 
 # whether contain chinese character
 def contains_chinese(text):
     return bool(chinese_char_pattern.search(text))
+
+
+def contains_khmer(text: str) -> bool:
+    return bool(khmer_char_pattern.search(text))
+
+
+def detect_tts_language(text: str) -> str:
+    """Best-effort script detection for splitting / normalization."""
+    if contains_chinese(text):
+        return "zh"
+    if contains_khmer(text):
+        return "km"
+    if thai_char_pattern.search(text):
+        return "th"
+    return "en"
+
+
+def count_text_tokens(text: str, tokenize) -> int:
+    try:
+        ids = tokenize(text)
+        return len(ids) if isinstance(ids, (list, tuple)) else len(list(ids))
+    except Exception:
+        return len(text)
 
 
 # replace special symbol
@@ -57,19 +82,21 @@ def spell_out_number(text: str, inflect_parser):
 # 3. split sentence according to puncatation
 def split_paragraph(text: str, tokenize, lang="zh", token_max_n=80, token_min_n=60, merge_len=20, comma_split=False):
     def calc_utt_length(_text: str):
-        if lang == "zh":
-            return len(_text)
-        else:
-            return len(tokenize(_text))
+        if lang in ("zh", "km", "th"):
+            return len(_text.strip())
+        return count_text_tokens(_text, tokenize)
 
     def should_merge(_text: str):
-        if lang == "zh":
-            return len(_text) < merge_len
-        else:
-            return len(tokenize(_text)) < merge_len
+        if lang in ("zh", "km", "th"):
+            return len(_text.strip()) < merge_len
+        return count_text_tokens(_text, tokenize) < merge_len
 
     if lang == "zh":
         pounc = ["。", "？", "！", "；", "：", "、", ".", "?", "!", ";"]
+    elif lang == "km":
+        pounc = ["។", "៕", "?", "!", ".", ";", ":", "၊", "၊", "…"]
+    elif lang == "th":
+        pounc = [".", "?", "!", ";", ":", "ๆ"]
     else:
         pounc = [".", "?", "!", ";", ":"]
     if comma_split:
@@ -89,6 +116,8 @@ def split_paragraph(text: str, tokenize, lang="zh", token_max_n=80, token_min_n=
     if len(utts) == 0:
         if lang == "zh":
             utts.append(text + "。")
+        elif lang == "km":
+            utts.append(text + "។")
         else:
             utts.append(text + ".")
     final_utts = []
@@ -105,6 +134,240 @@ def split_paragraph(text: str, tokenize, lang="zh", token_max_n=80, token_min_n=
             final_utts.append(cur_utt)
 
     return final_utts
+
+
+# Khmer sentence / clause punctuation (keep ។ attached to the phrase before it).
+_KHMER_SENTENCE_BREAK = regex.compile(
+    r"(?<=[។៕])\s*|(?<=[!?])(?=\s+[\u1780-\u17ff])|(?:\r?\n)+"
+)
+_KHMER_CLAUSE_BREAK = regex.compile(r"(?<=[៖])\s*")
+
+
+def _khmer_grapheme_chunks(text: str, max_chars: int) -> list[str]:
+    """Last resort: split by Unicode grapheme clusters, never inside a combining mark."""
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+    graphemes = regex.findall(r"\X", text)
+    chunks: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for g in graphemes:
+        g_len = len(g)
+        if cur and cur_len + g_len > max_chars:
+            chunks.append("".join(cur))
+            cur = [g]
+            cur_len = g_len
+        else:
+            cur.append(g)
+            cur_len += g_len
+    if cur:
+        chunks.append("".join(cur))
+    return chunks
+
+
+def split_khmer_paragraph(
+    text: str,
+    max_chars: int = 140,
+    min_chars: int = 60,
+    merge_len: int = 30,
+) -> list[str]:
+    """
+    Split Khmer text only at sentence boundaries (។ ៕ …) and safe clause breaks.
+    Avoids comma / fixed-width cuts that break words and combining marks.
+    """
+    text = text.strip()
+    if not text:
+        return []
+
+    # Normalize stray spaces around Khmer punctuation
+    text = regex.sub(r"\s*([។៕])\s*", r"\1", text)
+    text = regex.sub(r"\s+", " ", text).strip()
+
+    sentences: list[str] = []
+    start = 0
+    for match in _KHMER_SENTENCE_BREAK.finditer(text):
+        end = match.end()
+        piece = text[start:end].strip()
+        if piece:
+            sentences.append(piece)
+        start = end
+    tail = text[start:].strip()
+    if tail:
+        sentences.append(tail)
+    if not sentences:
+        sentences = [text]
+
+    merged: list[str] = []
+    cur = ""
+    for sent in sentences:
+        if not sent:
+            continue
+        if len(sent) > max_chars:
+            if cur:
+                if len(cur) >= merge_len or not merged:
+                    merged.append(cur)
+                else:
+                    merged[-1] = merged[-1] + cur
+                cur = ""
+            merged.extend(_split_khmer_oversized_clause(sent, max_chars, min_chars))
+            continue
+
+        trial = cur + sent
+        if len(trial) <= max_chars:
+            cur = trial
+            continue
+
+        if len(cur) >= min_chars:
+            merged.append(cur)
+            cur = sent
+        elif merged:
+            merged[-1] = merged[-1] + cur + sent
+            cur = ""
+        else:
+            cur = trial
+
+    if cur:
+        if len(cur) < merge_len and merged:
+            merged[-1] = merged[-1] + cur
+        else:
+            merged.append(cur)
+
+    return [m.strip() for m in merged if m.strip()]
+
+
+def _split_khmer_oversized_clause(clause: str, max_chars: int, min_chars: int) -> list[str]:
+    """Split a long Khmer clause without breaking ។ or graphemes."""
+    parts: list[str] = []
+    start = 0
+    for match in _KHMER_CLAUSE_BREAK.finditer(clause):
+        end = match.end()
+        piece = clause[start:end].strip()
+        if piece:
+            parts.append(piece)
+        start = end
+    tail = clause[start:].strip()
+    if tail:
+        parts.append(tail)
+    if not parts:
+        parts = [clause]
+
+    out: list[str] = []
+    for part in parts:
+        if len(part) <= max_chars:
+            out.append(part)
+        elif " " in part:
+            buf = ""
+            for word in part.split():
+                trial = f"{buf} {word}".strip() if buf else word
+                if len(trial) > max_chars and buf:
+                    out.append(buf)
+                    buf = word
+                else:
+                    buf = trial
+            if buf:
+                if len(buf) > max_chars:
+                    out.extend(_khmer_grapheme_chunks(buf, max_chars))
+                else:
+                    out.append(buf)
+        else:
+            out.extend(_khmer_grapheme_chunks(part, max_chars))
+
+    merged: list[str] = []
+    cur = ""
+    for piece in out:
+        if len(piece) > max_chars:
+            if cur:
+                merged.append(cur)
+                cur = ""
+            merged.extend(_khmer_grapheme_chunks(piece, max_chars))
+            continue
+        if len(cur) + len(piece) <= max_chars:
+            cur += piece
+        else:
+            if cur:
+                merged.append(cur)
+            cur = piece
+    if cur:
+        merged.append(cur)
+    return merged
+
+
+def _char_window_for_lang(lang: str, max_tokens: int) -> int:
+    return {"km": 36, "th": 42, "zh": 48}.get(lang, max(32, max_tokens * 2))
+
+
+def refine_chunks_by_token_limit(
+    chunks: list[str],
+    tokenize,
+    max_tokens: int = 45,
+    lang: str = "en",
+) -> list[str]:
+    """Ensure every chunk is short enough for stable TTS (especially Khmer / long passages)."""
+    if lang == "km":
+        max_chars = min(160, max(100, max_tokens * 3))
+        refined: list[str] = []
+        for chunk in chunks:
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if count_text_tokens(chunk, tokenize) <= max_tokens and len(chunk) <= max_chars:
+                refined.append(chunk)
+            else:
+                refined.extend(split_khmer_paragraph(chunk, max_chars=max_chars))
+        return refined
+
+    refined: list[str] = []
+    char_window = _char_window_for_lang(lang, max_tokens)
+
+    def _push_piece(piece: str) -> None:
+        piece = piece.strip()
+        if not piece:
+            return
+        if count_text_tokens(piece, tokenize) <= max_tokens:
+            refined.append(piece)
+            return
+        for sub in _split_by_char_windows(piece, char_window):
+            if count_text_tokens(sub, tokenize) <= max_tokens:
+                refined.append(sub)
+            else:
+                half = max(16, char_window // 2)
+                refined.extend(_split_by_char_windows(sub, half))
+
+    for chunk in chunks:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if count_text_tokens(chunk, tokenize) <= max_tokens:
+            refined.append(chunk)
+            continue
+
+        if re.search(r"\s", chunk):
+            words = chunk.split()
+            buf = ""
+            for word in words:
+                trial = f"{buf} {word}".strip() if buf else word
+                if count_text_tokens(trial, tokenize) > max_tokens and buf:
+                    _push_piece(buf)
+                    buf = word
+                else:
+                    buf = trial
+            if buf:
+                _push_piece(buf)
+            continue
+
+        _push_piece(chunk)
+
+    return [c for c in refined if c.strip()]
+
+
+def _split_by_char_windows(text: str, window: int) -> list[str]:
+    text = text.strip()
+    if not text:
+        return []
+    return [text[i : i + window] for i in range(0, len(text), window)]
 
 
 # remove blank between chinese character
@@ -169,8 +432,22 @@ class TextNormalizer:
 
     def normalize(self, text, split=False):
         # 去除 Markdown 语法，去除表情符号，去除换行符
-        lang = "zh" if contains_chinese(text) else "en"
+        lang = detect_tts_language(text)
         text = clean_text(text)
+        # wetext TN only supports zh/en; other scripts keep cleaned raw text
+        if lang not in ("zh", "en"):
+            if split is False:
+                return text
+            tokenize = self.tokenizer if self.tokenizer is not None else (lambda t: list(t))
+            return split_paragraph(
+                text,
+                tokenize,
+                lang=lang,
+                token_max_n=50,
+                token_min_n=25,
+                merge_len=12,
+                comma_split=True,
+            )
         if lang == "zh":
             text = text.replace(
                 "=", "等于"
@@ -186,3 +463,13 @@ class TextNormalizer:
             text = spell_out_number(text, self.inflect_parser)
         if split is False:
             return text
+        tokenize = self.tokenizer if self.tokenizer is not None else (lambda t: list(t))
+        return split_paragraph(
+            text,
+            tokenize,
+            lang=lang,
+            token_max_n=50,
+            token_min_n=25,
+            merge_len=12,
+            comma_split=True,
+        )

@@ -57,7 +57,7 @@ def run_main(monkeypatch, argv):
 def test_parser_defaults_to_voxcpm2():
     parser = cli._build_parser()
     args = parser.parse_args(["design", "--text", "hello", "--output", "out.wav"])
-    assert args.hf_model_id == "openbmb/VoxCPM2"
+    assert args.hf_model_id == cli.DEFAULT_HF_MODEL_ID
     assert args.device == "auto"
     assert args.no_optimize is False
 

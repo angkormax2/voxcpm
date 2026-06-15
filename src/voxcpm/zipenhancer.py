@@ -23,7 +23,9 @@ class ZipEnhancer:
             model_path: ModelScope model path or local path
         """
         self.model_path = model_path
-        self._pipeline = pipeline(Tasks.acoustic_noise_suppression, model=self.model_path)
+        import torch
+        device = "gpu" if torch.cuda.is_available() else "cpu"
+        self._pipeline = pipeline(Tasks.acoustic_noise_suppression, model=self.model_path, device=device)
 
     def _normalize_loudness(self, wav_path: str):
         """

@@ -14,10 +14,17 @@ from typing import Optional
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root / "src"))
 
-# Default pretrained model path: prefer VoxCPM2 if it exists, fallback to VoxCPM1.5
-_v2_path = project_root / "models" / "openbmb__VoxCPM2"
+from voxcpm.paths import resolve_default_voxcpm2_path
+
+# Default pretrained model path: local VoxCPM2 if present, else VoxCPM1.5 or HF id
 _v15_path = project_root / "models" / "openbmb__VoxCPM1.5"
-default_pretrained_path = str(_v2_path if _v2_path.exists() else _v15_path)
+_v2_default = resolve_default_voxcpm2_path(project_root)
+if _v2_default != "openbmb/VoxCPM2":
+    default_pretrained_path = _v2_default
+elif _v15_path.exists():
+    default_pretrained_path = str(_v15_path)
+else:
+    default_pretrained_path = _v2_default
 
 from voxcpm.core import VoxCPM
 from voxcpm.model.voxcpm import LoRAConfig

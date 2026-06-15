@@ -4,11 +4,25 @@ import re
 import json
 import tempfile
 import numpy as np
-from typing import Generator, Optional
+from typing import Callable, Generator, Optional, Union
 from huggingface_hub import snapshot_download
 from .model.voxcpm import VoxCPMModel, LoRAConfig
 from .model.voxcpm2 import VoxCPM2Model
 from .model.utils import next_and_close
+from .paths import resolve_default_voxcpm2_path
+
+# Long passages degrade quality; synthesize sentence-by-sentence instead.
+MAX_SINGLE_PASS_TARGET_TOKENS = 50
+MAX_CHUNK_TARGET_TOKENS = 45
+CHUNK_PAUSE_SEC = 0.15
+
+
+def _parse_control_prefix(text: str) -> tuple[str, str]:
+    """Split '(control)body' voice-design prefix from speakable body."""
+    match = re.match(r"^(\([^)]+\)|（[^）]+）)([\s\S]*)$", text.strip())
+    if match:
+        return match.group(1), match.group(2).strip()
+    return "", text.strip()
 
 
 class VoxCPM:
@@ -21,6 +35,7 @@ class VoxCPM:
         device: str | None = None,
         lora_config: Optional[LoRAConfig] = None,
         lora_weights_path: Optional[str] = None,
+        warmup: bool = True,
     ):
         """Initialize VoxCPM TTS pipeline.
 
@@ -39,6 +54,7 @@ class VoxCPM:
                 provided without lora_config, a default config will be created.
             lora_weights_path: Path to pre-trained LoRA weights (.pth file or directory
                 containing lora_weights.ckpt). If provided, LoRA weights will be loaded.
+            warmup: Run a short generation pass to warm up the model after loading.
         """
         print(
             f"voxcpm_model_path: {voxcpm_model_path}, zipenhancer_model_path: {zipenhancer_model_path}, enable_denoiser: {enable_denoiser}",
@@ -93,17 +109,13 @@ class VoxCPM:
             self.denoiser = ZipEnhancer(zipenhancer_model_path)
         else:
             self.denoiser = None
-        if optimize:
-            print("Warm up VoxCPMModel...", file=sys.stderr)
-            self.tts_model.generate(
-                target_text="Hello, this is the first test sentence.",
-                max_len=10,
-            )
+        if optimize and warmup:
+            self.run_warmup()
 
     @classmethod
     def from_pretrained(
         cls,
-        hf_model_id: str = "openbmb/VoxCPM2",
+        hf_model_id: str | None = None,
         load_denoiser: bool = True,
         zipenhancer_model_id: str = "iic/speech_zipenhancer_ans_multiloss_16k_base",
         cache_dir: str = None,
@@ -112,6 +124,7 @@ class VoxCPM:
         device: str | None = None,
         lora_config: Optional[LoRAConfig] = None,
         lora_weights_path: Optional[str] = None,
+        warmup: bool = True,
         **kwargs,
     ):
         """Instantiate ``VoxCPM`` from a Hugging Face Hub snapshot.
@@ -145,7 +158,7 @@ class VoxCPM:
             ValueError: If neither a valid ``hf_model_id`` nor a resolvable
                 ``hf_model_id`` is provided.
         """
-        repo_id = hf_model_id
+        repo_id = hf_model_id or resolve_default_voxcpm2_path()
         if not repo_id:
             raise ValueError("You must provide hf_model_id")
 
@@ -168,11 +181,102 @@ class VoxCPM:
             device=device,
             lora_config=lora_config,
             lora_weights_path=lora_weights_path,
+            warmup=warmup,
             **kwargs,
         )
 
-    def generate(self, *args, **kwargs) -> np.ndarray:
-        return next_and_close(self._generate(*args, streaming=False, **kwargs))
+    def _count_text_tokens(self, text: str) -> int:
+        return len(self.tts_model.text_tokenizer(text))
+
+    def _preprocess_target_text(self, text: str, normalize: bool) -> str:
+        from .utils.text_normalize import clean_text, detect_tts_language
+
+        text = clean_text(text.replace("\n", " "))
+        text = re.sub(r"\s+", " ", text).strip()
+        lang = detect_tts_language(text)
+        if normalize and lang in ("zh", "en"):
+            if self.text_normalizer is None:
+                from .utils.text_normalize import TextNormalizer
+
+                self.text_normalizer = TextNormalizer(
+                    tokenizer=self.tts_model.text_tokenizer.tokenizer
+                )
+            text = self.text_normalizer.normalize(text, split=False)
+        return text
+
+    def _split_long_target_text(self, text: str) -> list[str]:
+        """Split long target text into short utterances for stable multilingual TTS."""
+        from .utils.text_normalize import (
+            detect_tts_language,
+            refine_chunks_by_token_limit,
+            split_khmer_paragraph,
+            split_paragraph,
+        )
+
+        control, body = _parse_control_prefix(text)
+        if not body:
+            body = text
+
+        lang = detect_tts_language(body)
+        tokenize = self.tts_model.text_tokenizer
+
+        if lang == "km":
+            # Khmer: split only at ។ / ៕ (never commas or blind char windows).
+            chunks = split_khmer_paragraph(body, max_chars=140, min_chars=60, merge_len=30)
+            chunks = refine_chunks_by_token_limit(
+                chunks, tokenize, max_tokens=MAX_CHUNK_TARGET_TOKENS, lang=lang
+            )
+        else:
+            chunks = split_paragraph(
+                body,
+                tokenize,
+                lang=lang,
+                token_max_n=50,
+                token_min_n=25,
+                merge_len=12,
+                comma_split=lang not in ("zh", "th"),
+            )
+            chunks = refine_chunks_by_token_limit(
+                chunks, tokenize, max_tokens=MAX_CHUNK_TARGET_TOKENS, lang=lang
+            )
+        if control:
+            chunks = [f"{control}{chunks[0]}"] + chunks[1:] if chunks else []
+        return chunks or [text]
+
+    def _should_split_target_text(self, text: str) -> bool:
+        return self._count_text_tokens(text) > MAX_SINGLE_PASS_TARGET_TOKENS
+
+    def prepare_synthesis_segments(self, text: str, normalize: bool = False) -> list[str]:
+        """Return the exact text segments that will be spoken (for UI preview / logs)."""
+        processed = self._preprocess_target_text(text, normalize=normalize)
+        if self._should_split_target_text(processed):
+            return self._split_long_target_text(processed)
+        return [processed]
+
+    def run_warmup(self, max_len: int = 10) -> None:
+        """Run a short generation pass to warm up kernels / compiled graphs."""
+        print("Warm up VoxCPMModel...", file=sys.stderr)
+        self.tts_model.generate(
+            target_text="Hello, this is the first test sentence.",
+            max_len=max_len,
+        )
+
+    def generate(self, *args, status_callback: Callable[[str], None] | None = None, **kwargs) -> np.ndarray:
+        gen = self._generate(*args, streaming=False, status_callback=status_callback, **kwargs)
+        result = None
+        for item in gen:
+            if isinstance(item, dict) and item.get("kind") == "status":
+                if status_callback:
+                    status_callback(item["message"])
+            else:
+                result = item
+        return result if result is not None else np.array([], dtype=np.float32)
+
+    def generate_with_status(
+        self, *args, **kwargs
+    ) -> Generator[Union[dict, np.ndarray], None, None]:
+        """Like generate() but yields ``{'kind':'status','message':...}`` before the final waveform."""
+        return self._generate(*args, streaming=False, **kwargs)
 
     def generate_streaming(self, *args, **kwargs) -> Generator[np.ndarray, None, None]:
         return self._generate(*args, streaming=True, **kwargs)
@@ -193,7 +297,9 @@ class VoxCPM:
         retry_badcase_max_times: int = 3,
         retry_badcase_ratio_threshold: float = 6.0,
         streaming: bool = False,
-    ) -> Generator[np.ndarray, None, None]:
+        progress_callback=None,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> Generator[Union[dict, np.ndarray], None, None]:
         """Synthesize speech for the given text and return a single waveform.
 
         Args:
@@ -238,8 +344,7 @@ class VoxCPM:
         if reference_wav_path is not None and not is_v2:
             raise ValueError("reference_wav_path is only supported with VoxCPM2 models")
 
-        text = text.replace("\n", " ")
-        text = re.sub(r"\s+", " ", text)
+        text = self._preprocess_target_text(text, normalize=normalize)
         temp_files = []
 
         try:
@@ -273,35 +378,117 @@ class VoxCPM:
             else:
                 fixed_prompt_cache = None
 
-            if normalize:
-                if self.text_normalizer is None:
-                    from .utils.text_normalize import TextNormalizer
-
-                    self.text_normalizer = TextNormalizer()
-                text = self.text_normalizer.normalize(text)
-
-            generate_result = self.tts_model._generate_with_prompt_cache(
-                target_text=text,
-                prompt_cache=fixed_prompt_cache,
-                min_len=min_len,
-                max_len=max_len,
-                inference_timesteps=inference_timesteps,
-                cfg_value=cfg_value,
-                retry_badcase=retry_badcase,
-                retry_badcase_max_times=retry_badcase_max_times,
-                retry_badcase_ratio_threshold=retry_badcase_ratio_threshold,
-                streaming=streaming,
+            target_chunks = (
+                self._split_long_target_text(text)
+                if self._should_split_target_text(text)
+                else [text]
             )
+            if len(target_chunks) > 1:
+                print(
+                    f"Long input split into {len(target_chunks)} segments for stable synthesis.",
+                    file=sys.stderr,
+                )
 
-            if streaming:
-                try:
-                    for wav, _, _ in generate_result:
-                        yield wav.squeeze(0).cpu().numpy()
-                finally:
-                    generate_result.close()
-            else:
-                wav, _, _ = next_and_close(generate_result)
-                yield wav.squeeze(0).cpu().numpy()
+            cache_kwargs = {}
+            if progress_callback is not None and isinstance(self.tts_model, VoxCPM2Model):
+                cache_kwargs["progress_callback"] = progress_callback
+
+            sample_rate = self.tts_model.sample_rate
+            pause_samples = int(CHUNK_PAUSE_SEC * sample_rate)
+            segment_wavs: list[np.ndarray] = []
+
+            n_chunks = len(target_chunks)
+            rolling_cache = fixed_prompt_cache
+            use_voice_continuation = n_chunks > 1 and is_v2
+            if n_chunks > 1 and is_v2:
+                print(
+                    "Multi-segment mode: chaining audio so the same voice continues across splits.",
+                    file=sys.stderr,
+                )
+
+            def _emit_status(message: str) -> None:
+                if status_callback:
+                    status_callback(message)
+                yield {"kind": "status", "message": message}
+
+            for chunk_idx, chunk_text in enumerate(target_chunks):
+                for ev in _emit_status(
+                    f"Segment {chunk_idx + 1}/{n_chunks} — synthesizing (one continuous voice)…"
+                ):
+                    yield ev
+
+                chunk_cache = dict(cache_kwargs)
+                if progress_callback is not None:
+
+                    def chunk_callback(step, total, _idx=chunk_idx, _n=n_chunks):
+                        if total <= 0:
+                            return
+                        overall_step = _idx * total + step
+                        overall_total = _n * total
+                        progress_callback(overall_step, overall_total)
+                        if status_callback and (
+                            step == 1
+                            or step == total
+                            or step % max(1, total // 6) == 0
+                        ):
+                            pct = 100.0 * overall_step / overall_total
+                            status_callback(
+                                f"Overall {pct:.0f}% — segment {_idx + 1}/{_n}, "
+                                f"step {step}/{total}"
+                            )
+
+                    chunk_cache["progress_callback"] = chunk_callback
+
+                prompt_for_chunk = rolling_cache if use_voice_continuation else fixed_prompt_cache
+
+                generate_result = self.tts_model._generate_with_prompt_cache(
+                    target_text=chunk_text,
+                    prompt_cache=prompt_for_chunk,
+                    min_len=min_len,
+                    max_len=max_len,
+                    inference_timesteps=inference_timesteps,
+                    cfg_value=cfg_value,
+                    retry_badcase=retry_badcase,
+                    retry_badcase_max_times=retry_badcase_max_times,
+                    retry_badcase_ratio_threshold=retry_badcase_ratio_threshold,
+                    streaming=streaming,
+                    **chunk_cache,
+                )
+
+                if streaming:
+                    try:
+                        for wav, _, _ in generate_result:
+                            yield wav.squeeze(0).cpu().numpy()
+                    finally:
+                        generate_result.close()
+                    return
+
+                wav, _, pred_audio_feat = next_and_close(generate_result)
+                segment = wav.squeeze(0).cpu().numpy()
+                segment_wavs.append(segment)
+
+                if (
+                    use_voice_continuation
+                    and chunk_idx < n_chunks - 1
+                    and isinstance(self.tts_model, VoxCPM2Model)
+                ):
+                    rolling_cache = self.tts_model.merge_prompt_cache(
+                        rolling_cache,
+                        chunk_text,
+                        pred_audio_feat,
+                    )
+                    for ev in _emit_status(
+                        f"Segment {chunk_idx + 1}/{n_chunks} done — carrying voice into next part…"
+                    ):
+                        yield ev
+
+                if chunk_idx < n_chunks - 1 and pause_samples > 0:
+                    segment_wavs.append(np.zeros(pause_samples, dtype=segment.dtype))
+
+            if not streaming:
+                for ev in _emit_status("All segments complete — decoding final audio…"):
+                    yield ev
+                yield np.concatenate(segment_wavs) if segment_wavs else np.array([], dtype=np.float32)
 
         finally:
             for tmp_path in temp_files:

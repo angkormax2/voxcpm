@@ -11,7 +11,9 @@ import os
 import sys
 from pathlib import Path
 
-DEFAULT_HF_MODEL_ID = "openbmb/VoxCPM2"
+from .paths import HF_DEFAULT_VOXCPM2, resolve_default_voxcpm2_path
+
+DEFAULT_HF_MODEL_ID = resolve_default_voxcpm2_path()
 
 # -----------------------------
 # Validators

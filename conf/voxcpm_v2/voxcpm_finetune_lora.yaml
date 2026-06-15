@@ -1,4 +1,4 @@
-pretrained_path: /path/to/VoxCPM2/
+pretrained_path: ./VoxCPM2/
 train_manifest: /path/to/train.jsonl
 val_manifest: null
 sample_rate: 16000        # AudioVAE encoder input rate; must match audio_vae_config.sample_rate

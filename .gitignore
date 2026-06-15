@@ -3,4 +3,10 @@ __pycache__
 voxcpm.egg-info
 .DS_Store
 ./pretrained_models/
+VoxCPM2/
+data/voice_profiles/
 app_local.py
+.venv/
+starter-kit/node_modules/
+starter-kit/.next/
+full-version/
