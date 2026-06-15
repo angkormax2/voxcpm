@@ -33,6 +33,35 @@
 
 ---
 
+## Troubleshooting push / deploy
+
+### `Permission denied to pamais` (403)
+GitHub CLI is logged in as **pamais**, but repos are under **angkormax2**. Fix one of:
+
+1. **Log in as angkormax2** (recommended):
+   ```powershell
+   gh auth login
+   git config --global credential.helper manager
+   ```
+   Choose GitHub.com → HTTPS → login as **angkormax2**.
+
+2. **Or** add `pamais` as collaborator on both repos (Settings → Collaborators).
+
+### `angkormax2/api` not found
+Create it while logged in as **angkormax2**:
+- https://github.com/new → name `api` → **Private** → Create
+- Then push from `license_server/` (commands in section A above).
+
+### FastAPI Cloud not logged in
+```powershell
+cd license_server
+$env:PYTHONUTF8=1
+fastapi login
+powershell -ExecutionPolicy Bypass -File deploy.ps1
+```
+
+---
+
 ## A. Push API (private) — `angkormax2/api`
 
 The API is the `license_server/` folder as its **own git repo**.
