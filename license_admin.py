@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 import tkinter as tk
 from datetime import datetime, timezone
@@ -370,6 +371,35 @@ class LicenseAdminApp:
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Cannot reach server: {exc.reason}") from exc
 
+    def _admin_delete_license(self, license_id: str) -> tuple[bool, str]:
+        lid = urllib.parse.quote(license_id.strip(), safe="")
+        last_err = ""
+        for method in ("DELETE", "POST"):
+            try:
+                self._admin_request(method, f"/admin/delete/{lid}")
+                return True, ""
+            except RuntimeError as exc:
+                last_err = str(exc)
+                if last_err == "Not Found" and method == "DELETE":
+                    continue
+        if last_err == "Not Found":
+            last_err = (
+                "Delete API not deployed yet (update license_server and run fastapi deploy)."
+            )
+        return False, last_err
+
+    def _remove_from_issued_log(self, *, license_id: str = "", key: str = "") -> None:
+        log = self._load_issued_log()
+        kept: list[dict] = []
+        for entry in log:
+            if license_id and entry.get("license_id") == license_id:
+                continue
+            if not license_id and key and entry.get("key") == key:
+                continue
+            kept.append(entry)
+        self._save_issued_log(kept)
+        self._refresh_manage_table()
+
     def _tab_manage(self, notebook: ttk.Notebook) -> None:
         tab = tk.Frame(notebook, bg=BG)
         notebook.add(tab, text="  Manage  ")
@@ -558,26 +588,20 @@ class LicenseAdminApp:
             )
             if not messagebox.askyesno("Delete license", prompt):
                 return
-            try:
-                self._admin_request("DELETE", f"/admin/delete/{lid}")
-            except Exception as exc:
-                messagebox.showerror("Error", str(exc))
-                return
+            ok, err = self._admin_delete_license(lid)
+            if not ok:
+                remove_local = messagebox.askyesno(
+                    "Server delete failed",
+                    f"{err}\n\nRemove this row from your local list anyway?",
+                )
+                if not remove_local:
+                    return
         else:
             shown = key if self._key_stored(key) else "(local entry)"
             if not messagebox.askyesno("Remove from list", f"Remove this entry from the local list?\n\n{shown}"):
                 return
 
-        log = self._load_issued_log()
-        kept: list[dict] = []
-        for entry in log:
-            if lid and entry.get("license_id") == lid:
-                continue
-            if not lid and key and entry.get("key") == key:
-                continue
-            kept.append(entry)
-        self._save_issued_log(kept)
-        self._refresh_manage_table()
+        self._remove_from_issued_log(license_id=lid, key=key)
         messagebox.showinfo("Deleted", "Removed from the list.")
 
     def _sync_server_licenses(self) -> None:
