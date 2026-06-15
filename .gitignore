@@ -17,5 +17,15 @@ starter-kit/node_modules/
 starter-kit/.next/
 full-version/
 license_server/
+
+# Author-only — keep on your PC, never push to public client repo
+License Admin.bat
+License Admin.vbs
+license_admin.py
+tools/issue_license.py
+tools/generate_license_keys.py
 tools/license_private.pem
 tools/licenses.db
+docs/GITHUB_PUSH.md
+docs/AUTHOR.md
+assets/studio_repo.url
