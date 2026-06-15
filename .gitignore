@@ -5,8 +5,16 @@ voxcpm.egg-info
 ./pretrained_models/
 VoxCPM2/
 data/voice_profiles/
+data/license.json
+data/license_admin_config.json
+data/bin/
+data/video_outputs/
+data/video_temp/
 app_local.py
 .venv/
 starter-kit/node_modules/
 starter-kit/.next/
 full-version/
+license_server/
+tools/license_private.pem
+tools/licenses.db

@@ -1,0 +1,3 @@
+# Put your deployed license server URL on the next line (no trailing slash).
+# Example after FastAPI Cloud deploy:
+# https://voxcpm-license.fastapicloud.dev

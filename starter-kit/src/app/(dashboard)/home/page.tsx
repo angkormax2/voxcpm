@@ -1,5 +1,6 @@
 "use client";
 
+import { STUDIO_NAME } from "@configs/studioBranding";
 import { useState, useEffect, useRef, useMemo } from "react";
 import axios from "axios";
 import {
@@ -357,7 +358,7 @@ export default function VoxCPMStudio() {
           WebkitTextFillColor: "transparent"
         }}
       >
-        VoxCPM2 Studio
+        {STUDIO_NAME}
       </Typography>
 
       {error && <Alert severity="error" sx={{ mb: 2 }} onClose={() => setError("")}>{error}</Alert>}

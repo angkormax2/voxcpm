@@ -1,5 +1,5 @@
 @echo off
-title VoxCPM2 Studio - Stop Servers
+title VoxCPM2 Studio By BONG Pisith - Stop Servers
 
 echo.
 echo Stopping VoxCPM servers on ports 8000 and 3000...

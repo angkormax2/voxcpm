@@ -48,7 +48,8 @@ dependencies = [
     "safetensors",
     "fastapi",
     "uvicorn",
-    "python-multipart"
+    "python-multipart",
+    "cryptography>=42.0.0",
 ]
 
 [project.optional-dependencies]

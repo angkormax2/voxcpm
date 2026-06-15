@@ -1325,7 +1325,7 @@ def create_demo_interface(demo: VoxCPMDemo):
             '<div class="vox-header">'
             '<img src="/gradio_api/file=assets/voxcpm_logo.png" alt="VoxCPM Logo">'
             '<div class="vox-header-text">'
-            '<div class="vox-header-title">VoxCPM2 Studio <span class="vox-badge">v2.0</span></div>'
+            '<div class="vox-header-title">VoxCPM2 Studio By BONG Pisith <span class="vox-badge">v2.0</span></div>'
             '<div class="vox-header-subtitle">Creative Multilingual Text-to-Speech · Voice Design · Voice Cloning</div>'
             '</div>'
             '</div>'

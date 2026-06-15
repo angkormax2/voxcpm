@@ -12,6 +12,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from studio_branding import STUDIO_NAME
+
+from license_manager import require_valid_license
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 VENV_PYTHON = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
 STARTER_KIT = PROJECT_ROOT / "starter-kit"
@@ -388,8 +392,8 @@ def wait_for_servers(timeout_sec: int = 90) -> bool:
     return False
 
 
-def bootstrap_studio(manager: StudioManager, *, open_browser: bool = True) -> bool:
-    """Setup (if needed) and start servers — used before showing the GUI."""
+def bootstrap_setup(manager: StudioManager) -> bool:
+    """Install dependencies if needed — no license required."""
     if not ensure_prerequisites(manager.log):
         return False
     manager.log("Checking requirements…")
@@ -399,11 +403,19 @@ def bootstrap_studio(manager: StudioManager, *, open_browser: bool = True) -> bo
         if not manager.setup():
             manager.log("Setup failed.")
             return False
+    manager.log("Setup check complete.")
+    return True
+
+
+def bootstrap_studio(manager: StudioManager, *, open_browser: bool = True) -> bool:
+    """Setup if needed, then start servers (valid license required to start)."""
+    if not bootstrap_setup(manager):
+        return False
     if not manager.start(open_browser=open_browser):
         return False
     manager.log("Waiting for servers…")
     if wait_for_servers():
-        manager.log("Studio is ready.")
+        manager.log(f"{STUDIO_NAME} is ready.")
         return True
     manager.log("Servers started but not fully ready yet — check the log.")
     return True
@@ -542,6 +554,12 @@ class StudioManager:
         return True
 
     def start(self, open_browser: bool = True) -> bool:
+        try:
+            access = require_valid_license()
+            self.log(access.message)
+        except RuntimeError as exc:
+            self.log(f"Cannot start — {exc}")
+            return False
         if self.running:
             self.log("Servers already running.")
             return True
@@ -604,6 +622,6 @@ class StudioManager:
 
             threading.Thread(target=_open, daemon=True).start()
 
-        self.log("Studio starting — UI: http://localhost:3000/home")
+        self.log(f"{STUDIO_NAME} starting — UI: http://localhost:3000/home")
         self.log("API: http://127.0.0.1:8000")
         return True

@@ -15,6 +15,8 @@ import torch
 # this order can leave torch.cuda.is_available() stuck on False.
 from app import VoxCPMDemo, DEFAULT_MODEL_ID, ProcessLog
 
+from license_manager import require_valid_license, revalidate_online_license
+
 import os
 import io
 import uuid
@@ -53,6 +55,15 @@ if torch.cuda.is_available():
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    try:
+        access = require_valid_license()
+    except RuntimeError as exc:
+        print("================================================================")
+        print("  LICENSE ERROR:", exc)
+        print("  Enter a license in the launcher before Open UI or Start Studio.")
+        print("================================================================")
+        raise
+    print(f"  {access.message}")
     demo.refresh_device()
     cuda = describe_cuda_status()
     print("================================================================")
@@ -72,7 +83,9 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="VoxCPM API", version="1.0.0", lifespan=lifespan)
+from studio_branding import STUDIO_NAME
+
+app = FastAPI(title=STUDIO_NAME, version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -199,6 +212,10 @@ def generate_audio(
         def worker() -> None:
             temp_ref_path: str | None = None
             try:
+                online_check = revalidate_online_license(force=True)
+                if not online_check.ok:
+                    log_queue.put({"type": "error", "message": online_check.message})
+                    return
 
                 def on_line(line: str) -> None:
                     log_queue.put({"type": "log", "line": line})

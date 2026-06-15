@@ -16,10 +16,12 @@ import '@/app/globals.css'
 // Generated Icon CSS Imports
 import '@assets/iconify-icons/generated-icons.css'
 
+// Config Imports
+import { STUDIO_NAME } from '@configs/studioBranding'
+
 export const metadata = {
-  title: 'Materio - Material Design Next.js Admin Template',
-  description:
-    'Materio - Material Design Next.js Admin Dashboard Template - is the most developer friendly & highly customizable Admin Dashboard Template based on MUI v5.'
+  title: STUDIO_NAME,
+  description: `${STUDIO_NAME} — multilingual text-to-speech with voice design and cloning.`
 }
 
 const RootLayout = async (props: ChildrenType) => {

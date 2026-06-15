@@ -69,7 +69,7 @@ Chinese Dialect: 四川话, 粤语, 吴语, 东北话, 河南话, 陕西话, 山
 ## Contents
 
 - [Quick Start](#-quick-start)
-  - [VoxCPM2 Studio (Windows)](#voxcpm2-studio-windows)
+  - [VoxCPM2 Studio By BONG Pisith (Windows)](#voxcpm2-studio-by-bong-pisith-windows)
   - [Installation](#installation)
   - [Python API](#python-api)
   - [CLI Usage](#cli-usage)
@@ -87,9 +87,9 @@ Chinese Dialect: 四川话, 粤语, 吴语, 东北话, 河南话, 陕西话, 山
 
 ## 🚀 Quick Start
 
-### VoxCPM2 Studio (Windows)
+### VoxCPM2 Studio By BONG Pisith (Windows)
 
-Clone this repo on another PC, then double-click **`VoxCPM Studio.bat`**. The launcher installs Python/Node (via winget if needed), dependencies, VoxCPM2 weights, and opens the Studio UI at `http://localhost:3000/home`.
+Clone this repo on another PC, then double-click **`VoxCPM Studio.bat`**. The launcher installs Python/Node (via winget if needed), dependencies, VoxCPM2 weights, and opens **VoxCPM2 Studio By BONG Pisith** at `http://localhost:3000/home`.
 
 See **[STUDIO.md](STUDIO.md)** for the full clone-and-run guide and troubleshooting.
 

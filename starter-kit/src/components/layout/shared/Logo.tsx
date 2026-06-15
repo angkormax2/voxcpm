@@ -4,17 +4,18 @@
 import { useEffect, useRef } from 'react'
 import type { CSSProperties } from 'react'
 
+// Next Imports
+import Image from 'next/image'
+
 // Third-party Imports
 import styled from '@emotion/styled'
 
 // Type Imports
 import type { VerticalNavContextProps } from '@menu/contexts/verticalNavContext'
 
-// Component Imports
-import MaterioLogo from '@core/svg/Logo'
-
 // Config Imports
 import themeConfig from '@configs/themeConfig'
+import { APP_ICON_PATH } from '@configs/studioBranding'
 
 // Hook Imports
 import useVerticalNav from '@menu/hooks/useVerticalNav'
@@ -30,11 +31,11 @@ type LogoTextProps = {
 
 const LogoText = styled.span<LogoTextProps>`
   color: ${({ color }) => color ?? 'var(--mui-palette-text-primary)'};
-  font-size: 1.25rem;
-  line-height: 1.2;
+  font-size: 1rem;
+  line-height: 1.25;
   font-weight: 600;
   letter-spacing: 0.15px;
-  text-transform: uppercase;
+  text-transform: none;
   transition: ${({ transitionDuration }) =>
     `margin-inline-start ${transitionDuration}ms ease-in-out, opacity ${transitionDuration}ms ease-in-out`};
 
@@ -45,14 +46,11 @@ const LogoText = styled.span<LogoTextProps>`
 `
 
 const Logo = ({ color }: { color?: CSSProperties['color'] }) => {
-  // Refs
   const logoTextRef = useRef<HTMLSpanElement>(null)
 
-  // Hooks
   const { isHovered, transitionDuration, isBreakpointReached } = useVerticalNav()
   const { settings } = useSettings()
 
-  // Vars
   const { layout } = settings
 
   useEffect(() => {
@@ -72,7 +70,14 @@ const Logo = ({ color }: { color?: CSSProperties['color'] }) => {
 
   return (
     <div className='flex items-center min-bs-[24px]'>
-      <MaterioLogo className='text-[22px] text-primary' />
+      <Image
+        src={APP_ICON_PATH}
+        alt='VoxCPM'
+        width={28}
+        height={28}
+        className='rounded-[6px] shrink-0'
+        priority
+      />
       <LogoText
         color={color}
         ref={logoTextRef}
