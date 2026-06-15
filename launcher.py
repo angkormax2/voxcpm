@@ -5,6 +5,7 @@ from __future__ import annotations
 import queue
 import sys
 import threading
+import webbrowser
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
 
@@ -14,13 +15,20 @@ from license_manager import (
     current_license_status,
     get_machine_id,
 )
-from studio_branding import STUDIO_NAME
+from studio_branding import (
+    LICENSE_CONTACT_HINT,
+    LICENSE_CONTACT_LABEL,
+    LICENSE_CONTACT_URL,
+    STUDIO_NAME,
+)
 from launcher_core import (
     PROJECT_ROOT,
     StudioManager,
     _port_open,
     bootstrap_setup,
+    center_tk_window,
     run_checks,
+    wait_for_servers,
 )
 
 ASSETS = PROJECT_ROOT / "assets"
@@ -42,8 +50,8 @@ class StudioLauncherApp:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title(STUDIO_NAME)
-        self.root.geometry("720x640")
-        self.root.minsize(600, 520)
+        self.root.geometry("740x680")
+        self.root.minsize(620, 560)
         self.root.configure(bg=BG)
 
         self.log_queue: queue.Queue[str] = queue.Queue()
@@ -53,17 +61,21 @@ class StudioLauncherApp:
         self._window_icon: tk.PhotoImage | None = None
         self._header_logo: tk.PhotoImage | None = None
         self._setup_started = False
+        self._log_visible = False
+        self._servers_up = False
 
         self._set_window_icon()
         self._build_main_ui()
+        center_tk_window(self.root, width=740, height=680)
 
         self.root.after(150, self._poll_log)
+        self.root.after(500, self.refresh_checks_async)
         self.root.after(3000, self._poll_server_status)
         self.root.after(1000, self._poll_access_status)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._enqueue_log(f"Welcome to {STUDIO_NAME}")
-        self._update_access_label()
+        self._refresh_license_panel()
         if not self._setup_started:
             self._setup_started = True
             threading.Thread(target=self._auto_setup, daemon=True).start()
@@ -98,22 +110,91 @@ class StudioLauncherApp:
         self.root.after(150, self._poll_log)
 
     def _poll_server_status(self) -> None:
-        if self.manager.running or (_port_open(8000) and _port_open(3000)):
-            self.status_var.set("Status: Running")
-        else:
-            self.status_var.set("Status: Stopped")
+        up = self.manager.running or (_port_open(8000) and _port_open(3000))
+        self.status_var.set("Status: Running" if up else "Status: Stopped")
+        if up != self._servers_up:
+            self._servers_up = up
+            self.refresh_checks_async()
         self.root.after(3000, self._poll_server_status)
 
-    def _poll_access_status(self) -> None:
-        self._update_access_label()
-        self.root.after(10000, self._poll_access_status)
+    def _wait_and_refresh_checks(self) -> None:
+        """Wait until API + UI ports are open, then refresh the requirements grid."""
 
-    def _update_access_label(self) -> None:
+        def work() -> None:
+            self._enqueue_log("Waiting for API and UI to be ready…")
+            ready = wait_for_servers(timeout_sec=120)
+            if ready:
+                self._enqueue_log("Servers are up.")
+            else:
+                self._enqueue_log("Servers still starting — checks will update when ready.")
+            self._servers_up = _port_open(8000) and _port_open(3000)
+            self.root.after(0, self.refresh_checks_async)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll_access_status(self) -> None:
+        self._refresh_license_panel()
+        self.root.after(60000, self._poll_access_status)
+
+    def _license_status_color(self, status: LicenseStatus) -> str:
+        if not status.ok:
+            return ERR
+        if status.expires == "dev":
+            return OK
+        days = status.remaining_days if status.remaining_days is not None else 999
+        if days <= 0:
+            return ERR
+        if days <= 7:
+            return WARN
+        return OK
+
+    def _refresh_license_panel(self) -> None:
         status = current_license_status()
+        color = self._license_status_color(status)
+
         if status.ok:
-            self.access_var.set(status.message)
+            self.license_state_var.set("Active")
+            self.license_state_label.configure(fg=color)
+            remaining = status.remaining_label or "—"
+            self.license_remaining_var.set(remaining)
+            self.license_remaining_label.configure(fg=color)
+            self.license_expires_var.set(f"Expires {status.expires or '—'}")
+            if status.source:
+                self.license_type_var.set(f"Type: {status.source}")
+            else:
+                self.license_type_var.set("")
+            if status.remaining_days is not None and status.expires != "dev":
+                pct = min(100, max(0, int((status.remaining_days / 365) * 100)))
+                self.license_progress["value"] = pct
+                self.license_progress.pack(fill="x", pady=(6, 0))
+            else:
+                self.license_progress.pack_forget()
         else:
-            self.access_var.set("No license — Enter license before Open UI or Start Studio")
+            self.license_state_var.set("Not activated")
+            self.license_state_label.configure(fg=ERR)
+            self.license_remaining_var.set(LICENSE_CONTACT_HINT)
+            self.license_remaining_label.configure(fg=MUTED)
+            self.license_expires_var.set("Enter a license to use Open UI / Start Studio")
+            self.license_type_var.set("")
+            self.license_progress.pack_forget()
+
+        if hasattr(self, "access_var"):
+            self.access_var.set(status.message if status.ok else "")
+
+    def _open_license_contact(self) -> None:
+        webbrowser.open(LICENSE_CONTACT_URL)
+
+    def _show_activation_success(self, result: LicenseStatus) -> None:
+        remaining = result.remaining_label or "—"
+        kind = (result.source or "offline").capitalize()
+        messagebox.showinfo(
+            "License activated",
+            f"Your license is now active.\n\n"
+            f"Time remaining: {remaining}\n"
+            f"Expiry date: {result.expires or '—'}\n"
+            f"License type: {kind}\n\n"
+            "You can click Open UI or Start Studio.",
+        )
 
     def _set_window_icon(self) -> None:
         try:
@@ -139,17 +220,39 @@ class StudioLauncherApp:
         win = tk.Toplevel(self.root)
         win.title("Activate license")
         win.configure(bg=BG)
-        win.geometry("520x380")
+        win.geometry("540x460")
         win.transient(self.root)
         win.grab_set()
 
         tk.Label(
             win,
-            text="License activation",
-            font=("Segoe UI", 14, "bold"),
+            text="Activate your license",
+            font=("Segoe UI", 15, "bold"),
             fg=TEXT,
             bg=BG,
         ).pack(anchor="w", padx=16, pady=(14, 4))
+
+        contact = tk.Frame(win, bg=PANEL)
+        contact.pack(fill="x", padx=16, pady=(0, 8))
+        tk.Label(
+            contact,
+            text="Need a license?",
+            font=("Segoe UI", 9, "bold"),
+            fg=TEXT,
+            bg=PANEL,
+        ).pack(anchor="w", padx=12, pady=(10, 2))
+        tk.Label(
+            contact,
+            text=f"{LICENSE_CONTACT_HINT}\n{LICENSE_CONTACT_LABEL}",
+            font=("Segoe UI", 9),
+            fg=MUTED,
+            bg=PANEL,
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+        ttk.Button(contact, text="Open Telegram", command=self._open_license_contact).pack(
+            anchor="w", padx=12, pady=(0, 10)
+        )
+
         if note:
             tk.Label(
                 win,
@@ -157,7 +260,7 @@ class StudioLauncherApp:
                 font=("Segoe UI", 9),
                 fg=WARN,
                 bg=BG,
-                wraplength=480,
+                wraplength=500,
                 justify="left",
             ).pack(anchor="w", padx=16, pady=(0, 8))
 
@@ -165,7 +268,7 @@ class StudioLauncherApp:
         panel.pack(fill="both", expand=True, padx=16, pady=8)
 
         mid_var = tk.StringVar(value=get_machine_id())
-        tk.Label(panel, text="Machine ID:", fg=MUTED, bg=PANEL, font=("Segoe UI", 9)).pack(
+        tk.Label(panel, text="Your Machine ID (send to author):", fg=MUTED, bg=PANEL, font=("Segoe UI", 9)).pack(
             anchor="w", padx=12, pady=(12, 2)
         )
         row = tk.Frame(panel, bg=PANEL)
@@ -183,26 +286,31 @@ class StudioLauncherApp:
         def copy_mid() -> None:
             win.clipboard_clear()
             win.clipboard_append(mid_var.get())
+            status_var.set("Machine ID copied.")
 
         ttk.Button(row, text="Copy", command=copy_mid).pack(side="left", padx=(8, 0))
 
         tk.Label(
             panel,
-            text="License key (VCPM-.... online or VCPM2.... offline):",
+            text="License key (VCPM-.... online  or  VCPM2.... offline):",
             fg=MUTED,
             bg=PANEL,
             font=("Segoe UI", 9),
-        ).pack(anchor="w", padx=12, pady=(10, 2))
+        ).pack(anchor="w", padx=12, pady=(12, 2))
         key_entry = tk.Entry(panel, font=("Consolas", 9), bg="#0d1117", fg=TEXT, relief="flat")
-        key_entry.pack(fill="x", padx=12, ipady=5)
+        key_entry.pack(fill="x", padx=12, ipady=6)
+        key_entry.focus_set()
         status_var = tk.StringVar()
-        tk.Label(panel, textvariable=status_var, fg=MUTED, bg=PANEL, font=("Segoe UI", 9), wraplength=460).pack(
+        tk.Label(panel, textvariable=status_var, fg=MUTED, bg=PANEL, font=("Segoe UI", 9), wraplength=480).pack(
             anchor="w", padx=12, pady=8
         )
 
         def activate() -> None:
-            status_var.set("Checking…")
+            status_var.set("Checking license…")
             key = key_entry.get().strip()
+            if not key:
+                status_var.set("Paste your license key first.")
+                return
 
             def work() -> None:
                 try:
@@ -213,9 +321,10 @@ class StudioLauncherApp:
                 def done() -> None:
                     status_var.set(result.message)
                     if result.ok:
-                        self._update_access_label()
+                        self._refresh_license_panel()
                         self._enqueue_log(result.message)
                         win.destroy()
+                        self._show_activation_success(result)
 
                 win.after(0, done)
 
@@ -223,23 +332,17 @@ class StudioLauncherApp:
 
         btn_row = tk.Frame(panel, bg=PANEL)
         btn_row.pack(anchor="w", padx=12, pady=(0, 12))
-        ttk.Button(btn_row, text="Activate", command=activate).pack(side="left")
-        ttk.Button(btn_row, text="Close", command=win.destroy).pack(side="left", padx=(8, 0))
-        tk.Label(
-            panel,
-            text="Get a key: t.me/rornpisith",
-            fg=MUTED,
-            bg=PANEL,
-            font=("Segoe UI", 8),
-        ).pack(anchor="w", padx=12, pady=(0, 12))
+        ttk.Button(btn_row, text="Activate license", command=activate).pack(side="left")
+        ttk.Button(btn_row, text="Cancel", command=win.destroy).pack(side="left", padx=(8, 0))
+        center_tk_window(win, width=540, height=460, parent=self.root)
 
     def _ensure_licensed(self) -> bool:
         status = current_license_status()
-        self._update_access_label()
+        self._refresh_license_panel()
         if status.ok:
             return True
         self._show_license_dialog(status.message)
-        return False
+        return current_license_status().ok
 
     def _build_main_ui(self) -> None:
         header = tk.Frame(self.root, bg=BG)
@@ -263,22 +366,14 @@ class StudioLauncherApp:
         ).pack(anchor="w")
         tk.Label(
             title_text,
-            text="Setup runs automatically · license required for Open UI / Start Studio",
+            text="Voice studio · setup runs quietly in the background",
             font=("Segoe UI", 10),
             fg=MUTED,
             bg=BG,
         ).pack(anchor="w")
 
         self.access_var = tk.StringVar()
-        tk.Label(
-            header,
-            textvariable=self.access_var,
-            font=("Segoe UI", 9),
-            fg=MUTED,
-            bg=BG,
-            wraplength=680,
-            justify="left",
-        ).pack(anchor="w", pady=(6, 0))
+        self._build_license_panel()
 
         req_frame = tk.LabelFrame(
             self.root,
@@ -301,8 +396,9 @@ class StudioLauncherApp:
         )
         ttk.Button(btn_row, text="Run setup", command=self._run_setup).pack(side="left", padx=(0, 8))
         ttk.Button(btn_row, text="Enter license", command=lambda: self._show_license_dialog()).pack(
-            side="left"
+            side="left", padx=(0, 8)
         )
+        ttk.Button(btn_row, text="Get a license", command=self._open_license_contact).pack(side="left")
 
         srv_row = tk.Frame(self.root, bg=BG)
         srv_row.pack(fill="x", padx=16, pady=8)
@@ -320,7 +416,12 @@ class StudioLauncherApp:
         ttk.Button(srv_row, text="Stop", command=self._stop).pack(side="right", padx=(8, 0))
         ttk.Button(srv_row, text="Open UI", command=self._open_ui).pack(side="right")
 
-        log_frame = tk.LabelFrame(
+        log_toggle_row = tk.Frame(self.root, bg=BG)
+        log_toggle_row.pack(fill="x", padx=16, pady=(4, 0))
+        self.log_toggle_btn = ttk.Button(log_toggle_row, text="Show setup log", command=self._toggle_log)
+        self.log_toggle_btn.pack(side="left")
+
+        self.log_frame = tk.LabelFrame(
             self.root,
             text=" Log ",
             font=("Segoe UI", 10, "bold"),
@@ -328,10 +429,10 @@ class StudioLauncherApp:
             bg=PANEL,
             labelanchor="n",
         )
-        log_frame.pack(fill="both", expand=True, padx=16, pady=(8, 16))
+        # Log hidden until user asks — keeps the window clean (no extra CMD).
 
         self.log_box = scrolledtext.ScrolledText(
-            log_frame,
+            self.log_frame,
             height=14,
             font=("Consolas", 9),
             bg="#0d1117",
@@ -342,14 +443,96 @@ class StudioLauncherApp:
         )
         self.log_box.pack(fill="both", expand=True, padx=8, pady=8)
 
-        foot = tk.Label(
-            self.root,
-            text=f"Project: {PROJECT_ROOT}",
-            font=("Segoe UI", 8),
+        foot = tk.Frame(self.root, bg=BG)
+        foot.pack(fill="x", padx=16, pady=(8, 10))
+        tk.Label(
+            foot,
+            text=f"License support: {LICENSE_CONTACT_LABEL}",
+            font=("Segoe UI", 9),
             fg=MUTED,
             bg=BG,
+        ).pack(side="left")
+        tk.Label(
+            foot,
+            text="Open Telegram",
+            font=("Segoe UI", 9, "underline"),
+            fg=OK,
+            bg=BG,
+            cursor="hand2",
+        ).pack(side="left", padx=(8, 0))
+        foot.winfo_children()[-1].bind("<Button-1>", lambda _e: self._open_license_contact())
+
+    def _build_license_panel(self) -> None:
+        frame = tk.LabelFrame(
+            self.root,
+            text=" License ",
+            font=("Segoe UI", 10, "bold"),
+            fg=TEXT,
+            bg=PANEL,
+            labelanchor="n",
         )
-        foot.pack(anchor="w", padx=16, pady=(0, 10))
+        frame.pack(fill="x", padx=16, pady=(4, 8))
+
+        inner = tk.Frame(frame, bg=PANEL)
+        inner.pack(fill="x", padx=12, pady=10)
+
+        top = tk.Frame(inner, bg=PANEL)
+        top.pack(fill="x")
+
+        self.license_state_var = tk.StringVar(value="Checking…")
+        self.license_state_label = tk.Label(
+            top,
+            textvariable=self.license_state_var,
+            font=("Segoe UI", 12, "bold"),
+            fg=TEXT,
+            bg=PANEL,
+        )
+        self.license_state_label.pack(side="left")
+
+        ttk.Button(top, text="Enter license", command=lambda: self._show_license_dialog()).pack(
+            side="right"
+        )
+
+        self.license_remaining_var = tk.StringVar(value="—")
+        self.license_remaining_label = tk.Label(
+            inner,
+            textvariable=self.license_remaining_var,
+            font=("Segoe UI", 14, "bold"),
+            fg=OK,
+            bg=PANEL,
+        )
+        self.license_remaining_label.pack(anchor="w", pady=(8, 2))
+
+        self.license_expires_var = tk.StringVar(value="")
+        tk.Label(
+            inner,
+            textvariable=self.license_expires_var,
+            font=("Segoe UI", 9),
+            fg=MUTED,
+            bg=PANEL,
+        ).pack(anchor="w")
+
+        self.license_type_var = tk.StringVar(value="")
+        tk.Label(
+            inner,
+            textvariable=self.license_type_var,
+            font=("Segoe UI", 8),
+            fg=MUTED,
+            bg=PANEL,
+        ).pack(anchor="w", pady=(2, 0))
+
+        self.license_progress = ttk.Progressbar(inner, maximum=100, mode="determinate")
+        self.license_progress.pack_forget()
+
+    def _toggle_log(self) -> None:
+        if self._log_visible:
+            self.log_frame.pack_forget()
+            self._log_visible = False
+            self.log_toggle_btn.configure(text="Show setup log")
+        else:
+            self.log_frame.pack(fill="both", expand=True, padx=16, pady=(8, 12))
+            self._log_visible = True
+            self.log_toggle_btn.configure(text="Hide setup log")
 
     def _apply_checks(self, checks) -> None:
         for child in self.req_grid.winfo_children():
@@ -421,7 +604,7 @@ class StudioLauncherApp:
                 self.root.after(0, ask)
                 return
             self.manager.start(open_browser=True)
-            self.root.after(0, self.refresh_checks_async)
+            self.root.after(0, self._wait_and_refresh_checks)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -447,10 +630,12 @@ class StudioLauncherApp:
                     return
                 if not self.manager.start(open_browser=False):
                     return
+                self.root.after(0, self._wait_and_refresh_checks)
             import webbrowser
 
             webbrowser.open("http://localhost:3000/home")
-            self.root.after(0, self.refresh_checks_async)
+            if self.manager.running or (_port_open(8000) and _port_open(3000)):
+                self.root.after(0, self.refresh_checks_async)
 
         threading.Thread(target=work, daemon=True).start()
 

@@ -35,6 +35,57 @@ class LicenseStatus:
     machine_id: str | None = None
     license_id: str | None = None
     source: str | None = None
+    remaining_label: str | None = None
+    remaining_days: int | None = None
+    remaining_hours: int | None = None
+
+
+def license_expiry_end(expires: str) -> datetime:
+    """End of the expiry calendar day (UTC)."""
+    exp_date = date.fromisoformat(expires)
+    return datetime(exp_date.year, exp_date.month, exp_date.day, 23, 59, 59, tzinfo=timezone.utc)
+
+
+def format_remaining(expires: str | None) -> tuple[str, int, int]:
+    """Human label and (days, hours) until license expiry."""
+    if not expires or expires == "dev":
+        return "Development mode", 9999, 0
+    try:
+        end = license_expiry_end(expires)
+    except Exception:
+        return "Unknown", 0, 0
+
+    now = datetime.now(timezone.utc)
+    seconds = int((end - now).total_seconds())
+    if seconds <= 0:
+        return "Expired", 0, 0
+
+    days = seconds // 86400
+    hours = (seconds % 86400) // 3600
+    minutes = (seconds % 3600) // 60
+
+    if days > 0:
+        label = f"{days} day{'s' if days != 1 else ''}, {hours} hour{'s' if hours != 1 else ''} left"
+    elif hours > 0:
+        label = f"{hours} hour{'s' if hours != 1 else ''}, {minutes} min left"
+    else:
+        label = f"{minutes} minute{'s' if minutes != 1 else ''} left"
+    return label, days, hours
+
+
+def _with_remaining(status: LicenseStatus) -> LicenseStatus:
+    if not status.ok or not status.expires:
+        return status
+    label, days, hours = format_remaining(status.expires)
+    status.remaining_label = label
+    status.remaining_days = days
+    status.remaining_hours = hours
+    if days == 0 and hours < 24 and status.expires != "dev":
+        status.message = f"License expires soon — {label} (until {status.expires})."
+    elif status.expires != "dev":
+        src = f" · {status.source}" if status.source else ""
+        status.message = f"Licensed — {label}{src}"
+    return status
 
 
 def _b64url_encode(data: bytes) -> str:
@@ -173,7 +224,7 @@ def verify_signed_license(token: str, *, machine_id: str | None = None) -> Licen
         return LicenseStatus(False, f"License expired on {exp_date.isoformat()}.")
 
     source = str(payload.get("src", "offline"))
-    return LicenseStatus(
+    status = LicenseStatus(
         True,
         f"Licensed until {exp_date.isoformat()} ({source}).",
         expires=exp_date.isoformat(),
@@ -181,6 +232,7 @@ def verify_signed_license(token: str, *, machine_id: str | None = None) -> Licen
         license_id=str(payload.get("lid", "")),
         source=source,
     )
+    return _with_remaining(status)
 
 
 def save_license(token: str, *, last_online_check: str | None = None) -> None:
@@ -231,13 +283,15 @@ def _activate_online_key(key: str) -> LicenseStatus:
 
     now = datetime.now(timezone.utc).isoformat()
     save_license(token, last_online_check=now)
-    return LicenseStatus(
-        True,
-        f"Online license activated until {status.expires}.",
-        expires=status.expires,
-        machine_id=machine_id,
-        license_id=status.license_id,
-        source="online",
+    return _with_remaining(
+        LicenseStatus(
+            True,
+            f"Online license activated until {status.expires}.",
+            expires=status.expires,
+            machine_id=machine_id,
+            license_id=status.license_id,
+            source="online",
+        )
     )
 
 
@@ -308,8 +362,8 @@ def current_license_status() -> LicenseStatus:
         return LicenseStatus(False, "No license activated.", machine_id=get_machine_id())
     status = verify_signed_license(token)
     if status.ok and status.source == "online":
-        return revalidate_online_license()
-    return status
+        return _with_remaining(revalidate_online_license())
+    return _with_remaining(status)
 
 
 def activate_license_key(key: str) -> LicenseStatus:
@@ -331,6 +385,7 @@ def activate_license_key(key: str) -> LicenseStatus:
     status = verify_signed_license(key)
     if status.ok:
         save_license(key)
+        return _with_remaining(status)
     return status
 
 

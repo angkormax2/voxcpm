@@ -29,6 +29,33 @@ HF_VOXCPM2_REPO = "openbmb/VoxCPM2"
 LogFn = Callable[[str], None]
 
 
+def center_tk_window(
+    window,
+    *,
+    width: int | None = None,
+    height: int | None = None,
+    parent=None,
+) -> None:
+    """Place a Tk window at the center of the screen or over a parent window."""
+    window.update_idletasks()
+    w = width if width is not None else window.winfo_width()
+    h = height if height is not None else window.winfo_height()
+    if w <= 1:
+        w = window.winfo_reqwidth()
+    if h <= 1:
+        h = window.winfo_reqheight()
+    if parent is not None:
+        parent.update_idletasks()
+        x = parent.winfo_rootx() + max(0, (parent.winfo_width() - w) // 2)
+        y = parent.winfo_rooty() + max(0, (parent.winfo_height() - h) // 2)
+    else:
+        sw = window.winfo_screenwidth()
+        sh = window.winfo_screenheight()
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 2)
+    window.geometry(f"{w}x{h}+{x}+{y}")
+
+
 @dataclass
 class CheckResult:
     key: str
@@ -54,7 +81,7 @@ def _run(
         text=True,
         encoding="utf-8",
         errors="replace",
-        creationflags=_win_no_window(),
+        **_subprocess_hide_kwargs(),
     )
     if log:
         if proc.stdout.strip():
@@ -166,7 +193,7 @@ def _run_live(
         text=True,
         encoding="utf-8",
         errors="replace",
-        creationflags=_win_no_window(),
+        **_subprocess_hide_kwargs(),
     )
     assert proc.stdout is not None
     for line in proc.stdout:
@@ -218,6 +245,19 @@ def _win_no_window() -> int:
     return 0
 
 
+def _subprocess_hide_kwargs() -> dict:
+    """Hide console windows for child processes on Windows."""
+    if sys.platform != "win32":
+        return {}
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0
+    return {
+        "creationflags": subprocess.CREATE_NO_WINDOW,
+        "startupinfo": si,
+    }
+
+
 def _node_exe() -> str | None:
     return _which("node")
 
@@ -229,18 +269,23 @@ def _next_dev_cmd() -> list[str] | None:
     next_bin = STARTER_KIT / "node_modules" / "next" / "dist" / "bin" / "next"
     if not next_bin.is_file():
         return None
-    return [node, str(next_bin), "dev", "--turbopack"]
+    return [node, str(next_bin), "dev", "--turbopack", "-p", "3000"]
 
 
 def run_checks() -> list[CheckResult]:
     results: list[CheckResult] = []
+    hide = _subprocess_hide_kwargs()
 
     py = _which("python") or sys.executable
     py_ver = ""
     if py:
         try:
             py_ver = subprocess.check_output(
-                [py, "--version"], text=True, encoding="utf-8", errors="replace"
+                [py, "--version"],
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                **hide,
             ).strip()
         except Exception:
             py_ver = "unknown"
@@ -259,7 +304,11 @@ def run_checks() -> list[CheckResult]:
     if node:
         try:
             node_ver = subprocess.check_output(
-                ["node", "-v"], text=True, encoding="utf-8", errors="replace"
+                ["node", "-v"],
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                **hide,
             ).strip()
         except Exception:
             node_ver = "found"
@@ -282,6 +331,7 @@ def run_checks() -> list[CheckResult]:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                **hide,
             ).strip()
             if out:
                 has_nvidia = True
@@ -323,6 +373,7 @@ def run_checks() -> list[CheckResult]:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                **hide,
             ).strip().splitlines()
             if out:
                 torch_detail = f"{out[0]} ({out[1] if len(out) > 1 else '?'})"
@@ -463,7 +514,7 @@ class StudioManager:
         self._stop_proc(self._ui_proc, "UI")
         self._ui_proc = None
 
-        for port, name in ((8000, "API"), (3000, "UI")):
+        for port, name in ((8000, "API"), (3000, "UI"), (3001, "UI"), (3002, "UI")):
             if not _port_open(port):
                 continue
             try:
@@ -472,6 +523,7 @@ class StudioManager:
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    **_subprocess_hide_kwargs(),
                 )
                 for line in out.splitlines():
                     if f":{port} " in line and "LISTENING" in line:
@@ -479,6 +531,7 @@ class StudioManager:
                         subprocess.run(
                             ["taskkill", "/F", "/PID", pid],
                             capture_output=True,
+                            **_subprocess_hide_kwargs(),
                         )
                         self.log(f"Stopped {name} on port {port} (PID {pid})")
             except Exception as exc:
@@ -513,6 +566,7 @@ class StudioManager:
                 [str(VENV_PYTHON), "-c", "import torch"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                **_subprocess_hide_kwargs(),
             )
             torch_ok = True
         except Exception:
@@ -575,7 +629,6 @@ class StudioManager:
             time.sleep(1)
 
         self.log("Starting API + UI (no CMD windows)…")
-        flags = _win_no_window()
         child_env = os.environ.copy()
         child_env["PYTHONUTF8"] = "1"
         child_env["PYTHONIOENCODING"] = "utf-8"
@@ -585,8 +638,8 @@ class StudioManager:
             text=True,
             encoding="utf-8",
             errors="replace",
-            creationflags=flags,
             env=child_env,
+            **_subprocess_hide_kwargs(),
         )
 
         self._api_proc = subprocess.Popen(

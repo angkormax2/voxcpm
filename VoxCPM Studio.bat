@@ -1,5 +1,4 @@
 @echo off
 cd /d "%~dp0"
-start "" pythonw "%~dp0launcher.py" 2>nul
-if errorlevel 1 start "" python "%~dp0launcher.py"
+wscript.exe //nologo "%~dp0VoxCPM Studio.vbs"
 exit /b 0
