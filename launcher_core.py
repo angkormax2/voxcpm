@@ -81,16 +81,21 @@ def _run(
     run_env = os.environ.copy()
     if env:
         run_env.update(env)
-    proc = subprocess.run(
-        cmd,
-        cwd=str(cwd or PROJECT_ROOT),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env=run_env,
-        **_subprocess_hide_kwargs(),
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(cwd or PROJECT_ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=run_env,
+            **_subprocess_hide_kwargs(),
+        )
+    except FileNotFoundError:
+        if log:
+            log(f"Command not found: {cmd[0]}")
+        return 127
     if log:
         if proc.stdout.strip():
             for line in proc.stdout.strip().splitlines():
@@ -103,6 +108,45 @@ def _run(
 
 def _which(name: str) -> str | None:
     return shutil.which(name)
+
+
+def _find_node_exe() -> str | None:
+    """Full path to node.exe (Windows-safe for hidden subprocesses)."""
+    for exe in (
+        _which("node"),
+        r"C:\Program Files\nodejs\node.exe",
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "nodejs", "node.exe"),
+    ):
+        if exe and Path(exe).is_file():
+            return str(Path(exe).resolve())
+    return None
+
+
+def _npm_command(*args: str) -> list[str] | None:
+    """Build npm argv that works with CREATE_NO_WINDOW on Windows."""
+    node = _find_node_exe()
+    if not node:
+        return None
+    node_dir = Path(node).parent
+    npm_cli = node_dir / "node_modules" / "npm" / "bin" / "npm-cli.js"
+    if npm_cli.is_file():
+        return [node, str(npm_cli), *args]
+    for name in ("npm.cmd", "npm.exe"):
+        script = node_dir / name
+        if script.is_file():
+            if sys.platform == "win32" and name.endswith(".cmd"):
+                return ["cmd.exe", "/d", "/c", str(script), *args]
+            return [str(script), *args]
+    npm = _which("npm")
+    if npm:
+        if sys.platform == "win32" and npm.lower().endswith(".cmd"):
+            return ["cmd.exe", "/d", "/c", npm, *args]
+        return [npm, *args]
+    return None
+
+
+def _node_exe() -> str | None:
+    return _find_node_exe()
 
 
 def _python_version_tuple(exe: str) -> tuple[int, int] | None:
@@ -332,7 +376,7 @@ def ensure_prerequisites(log: LogFn) -> bool:
     if not _ensure_studio_python(log):
         return False
 
-    if not _which("node"):
+    if not _find_node_exe():
         if sys.platform != "win32":
             log("Node.js not found. Install from https://nodejs.org/")
             return False
@@ -343,9 +387,13 @@ def ensure_prerequisites(log: LogFn) -> bool:
             log("Node.js install failed. Install from https://nodejs.org/")
             return False
         _refresh_windows_path()
-        if not _which("node"):
+        if not _find_node_exe():
             log("Node.js installed but not on PATH. Restart the launcher or log in again.")
             return False
+
+    if not _npm_command("--version"):
+        log("npm not found next to Node.js. Reinstall Node.js LTS from https://nodejs.org/")
+        return False
 
     return True
 
@@ -431,10 +479,6 @@ def _subprocess_hide_kwargs() -> dict:
     }
 
 
-def _node_exe() -> str | None:
-    return _which("node")
-
-
 def _next_dev_cmd() -> list[str] | None:
     node = _node_exe()
     if not node:
@@ -469,12 +513,12 @@ def run_checks() -> list[CheckResult]:
         )
     )
 
-    node = _which("node")
+    node = _find_node_exe()
     node_ver = ""
     if node:
         try:
             node_ver = subprocess.check_output(
-                ["node", "-v"],
+                [node, "-v"],
                 text=True,
                 encoding="utf-8",
                 errors="replace",
@@ -775,19 +819,13 @@ class StudioManager:
         if not download_voxcpm2_weights(self.log):
             return False
 
-        if not _which("npm"):
-            self.log("Node.js/npm missing — run Setup again after installing Node.js.")
+        npm_cmd = _npm_command("install", "--no-audit", "--no-fund", "--loglevel=error")
+        if not npm_cmd:
+            self.log("Node.js/npm missing — install Node.js LTS, then run Setup again.")
             return False
 
         self.log("Installing frontend packages (npm)…")
-        if (
-            _run(
-                ["npm", "install", "--no-audit", "--no-fund", "--loglevel=error"],
-                cwd=STARTER_KIT,
-                log=self.log,
-            )
-            != 0
-        ):
+        if _run(npm_cmd, cwd=STARTER_KIT, log=self.log) != 0:
             self.log("npm install failed.")
             return False
 
