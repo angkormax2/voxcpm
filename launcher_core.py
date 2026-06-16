@@ -983,6 +983,30 @@ def run_checks() -> list[CheckResult]:
         )
     )
 
+    pkg_ok = False
+    pkg_detail = "Not installed"
+    if venv_ok:
+        try:
+            subprocess.check_call(
+                [str(VENV_PYTHON), "-c", "import voxcpm"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                **hide,
+            )
+            pkg_ok = True
+            pkg_detail = "import ok"
+        except Exception as exc:
+            pkg_detail = str(exc)
+    results.append(
+        CheckResult(
+            key="voxcpm",
+            label="VoxCPM package",
+            ok=pkg_ok,
+            detail=pkg_detail,
+            fix_hint="Click Run setup",
+        )
+    )
+
     npm_ok = (STARTER_KIT / "node_modules").is_dir()
     results.append(
         CheckResult(
@@ -1001,7 +1025,7 @@ def run_checks() -> list[CheckResult]:
             label="VoxCPM2 weights",
             ok=model_ok,
             detail="Local model found" if model_ok else "Not downloaded",
-            required=False,
+            required=True,
             fix_hint="Run Setup to download weights",
         )
     )
@@ -1029,25 +1053,8 @@ def required_ready(checks: list[CheckResult]) -> bool:
 
 
 def _studio_environment_ready() -> bool:
-    """True when venv, package imports, and frontend deps are usable."""
-    if not VENV_PYTHON.is_file():
-        return False
-    if not _python_supported(_python_version_tuple(str(VENV_PYTHON))):
-        return False
-    hide = _subprocess_hide_kwargs()
-    for code in ("import torch", "import voxcpm"):
-        try:
-            subprocess.check_call(
-                [str(VENV_PYTHON), "-c", code],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                **hide,
-            )
-        except Exception:
-            return False
-    if not (STARTER_KIT / "node_modules").is_dir():
-        return False
-    return True
+    """True when the requirements grid is all green (except optional GPU/servers)."""
+    return required_ready(run_checks())
 
 
 def wait_for_servers(timeout_sec: int = 90) -> bool:
