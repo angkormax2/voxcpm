@@ -372,10 +372,18 @@ export default function VoxCPMStudio() {
               <TextField
                 fullWidth
                 multiline
-                rows={4}
+                minRows={4}
+                maxRows={18}
                 placeholder="Enter the text you want to synthesize..."
                 value={text}
                 onChange={e => setText(e.target.value)}
+                InputProps={{
+                  sx: {
+                    '& textarea': {
+                      resize: 'vertical',
+                    },
+                  },
+                }}
               />
             </CardContent>
           </Card>

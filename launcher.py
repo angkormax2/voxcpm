@@ -390,7 +390,10 @@ def build_ui() -> None:
         ui.button(
             "Copy Machine ID",
             icon="content_copy",
-            on_click=lambda: ui.run_javascript(f"navigator.clipboard.writeText('{machine_id}')"),
+            on_click=lambda: (
+                ui.run_javascript(f"navigator.clipboard.writeText('{machine_id}')"),
+                ui.notify("Machine ID copied", type="positive"),
+            ),
         ).props("outline dense")
         key_input = ui.input("License key").props("outlined dense").classes("w-full")
         dlg_status = ui.label("").classes("text-caption")
@@ -473,7 +476,19 @@ def build_ui() -> None:
                                     ui.label("Not activated").classes("studio-subtitle")
                             if status.ok and status.expires:
                                 ui.label(f"Exp. {status.expires}").classes("text-caption text-grey")
-                        ui.button(icon="vpn_key", on_click=license_dialog.open).props("dense flat color=primary")
+                            ui.label(f"Machine ID: {machine_id[:10]}...").classes("text-caption text-grey")
+                        with ui.row().classes("items-center gap-0"):
+                            ui.button("License", icon="vpn_key", on_click=license_dialog.open).props(
+                                "dense flat color=primary"
+                            )
+                            ui.button(
+                                "ID",
+                                icon="content_copy",
+                                on_click=lambda: (
+                                    ui.run_javascript(f"navigator.clipboard.writeText('{machine_id}')"),
+                                    ui.notify("Machine ID copied", type="positive"),
+                                ),
+                            ).props("dense flat color=primary")
 
             ui_refs["license_panel"] = license_panel
             license_panel()
@@ -501,7 +516,9 @@ def build_ui() -> None:
                 on_click=lambda: request_refresh_checks(force=True, show_placeholder=True),
             ).props("dense outline")
             ui.button("Updates", icon="system_update", on_click=lambda: check_updates(manual=True)).props("dense outline")
-            ui.button("License", icon="chat", on_click=lambda: webbrowser.open(LICENSE_CONTACT_URL)).props("dense flat color=primary")
+            ui.button(
+                "License", icon="chat", on_click=lambda: webbrowser.open(LICENSE_CONTACT_URL)
+            ).props("dense flat color=primary")
 
         with ui.card().classes("studio-card compact-pad w-full"):
             ui.label("Requirements").classes("studio-section-title")
@@ -760,16 +777,20 @@ def build_ui() -> None:
         threading.Thread(target=work, daemon=True).start()
 
     def ensure_licensed() -> bool:
+        status = current_license_status()
         ui_refs["license_panel"].refresh()
-        if current_license_status().ok:
+        if status.ok:
             return True
         license_dialog.open()
-        return current_license_status().ok
+        return False
 
     def start_studio() -> None:
-        if not ensure_licensed():
+        if state.start_busy:
             return
         set_start_busy(True)
+        if not ensure_licensed():
+            set_start_busy(False)
+            return
 
         def work() -> None:
             checks = run_checks()
