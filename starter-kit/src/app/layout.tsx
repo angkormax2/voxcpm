@@ -21,7 +21,12 @@ import { STUDIO_NAME } from '@configs/studioBranding'
 
 export const metadata = {
   title: STUDIO_NAME,
-  description: `${STUDIO_NAME} — multilingual text-to-speech with voice design and cloning.`
+  description: `${STUDIO_NAME} — multilingual text-to-speech with voice design and cloning.`,
+  icons: {
+    icon: '/images/sinekool_icon.png',
+    shortcut: '/images/sinekool_icon.png',
+    apple: '/images/sinekool_icon.png'
+  }
 }
 
 const RootLayout = async (props: ChildrenType) => {

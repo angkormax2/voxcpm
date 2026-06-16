@@ -22,9 +22,13 @@ import io
 import uuid
 import base64
 import json
+import re
 import queue
 import threading
+import subprocess
 from contextlib import asynccontextmanager
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -96,6 +100,118 @@ app.add_middleware(
 )
 
 demo = VoxCPMDemo(model_id=DEFAULT_MODEL_ID)
+OUTPUT_DIR = Path("data") / "generated_audio"
+MAX_TTS_CHUNK_CHARS = 260
+MAX_TTS_CHUNKS = 80
+CHUNK_PAUSE_SECONDS = 0.12
+AUTO_FALLBACK_STYLE_BY_SPEAKER = {
+    "male": "neutral",
+    "female": "neutral",
+    "neutral": "neutral",
+    "child": "child",
+}
+VOICE_CONSISTENCY_DIRECTIVE = (
+    "Keep the exact same speaker identity and vocal timbre across all sentences and chunks. "
+    "Do not switch to another voice model, accent, or persona mid-output."
+)
+
+
+def _ensure_output_dir() -> Path:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    return OUTPUT_DIR
+
+
+def _list_output_files() -> list[dict[str, object]]:
+    out = _ensure_output_dir()
+    files = []
+    for p in sorted(out.glob("*.wav"), key=lambda x: x.stat().st_mtime, reverse=True):
+        st = p.stat()
+        files.append(
+            {
+                "name": p.name,
+                "size_bytes": st.st_size,
+                "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
+            }
+        )
+    return files
+
+
+def _split_long_text_for_tts(text: str, max_chars: int = MAX_TTS_CHUNK_CHARS) -> list[str]:
+    cleaned = " ".join((text or "").split()).strip()
+    if not cleaned:
+        return []
+    if len(cleaned) <= max_chars:
+        return [cleaned]
+
+    # Split by sentence boundaries first to preserve natural prosody.
+    sentence_parts = [s.strip() for s in re.split(r"(?<=[.!?။៕])\s+|(?<=[.!?])\n+", cleaned) if s.strip()]
+    if not sentence_parts:
+        sentence_parts = [cleaned]
+
+    chunks: list[str] = []
+    current = ""
+
+    def flush_current() -> None:
+        nonlocal current
+        if current.strip():
+            chunks.append(current.strip())
+        current = ""
+
+    for sentence in sentence_parts:
+        if len(sentence) > max_chars:
+            words = sentence.split()
+            piece = ""
+            for word in words:
+                candidate = f"{piece} {word}".strip()
+                if len(candidate) <= max_chars:
+                    piece = candidate
+                else:
+                    if piece:
+                        chunks.append(piece.strip())
+                    piece = word
+            if piece:
+                if current and len(f"{current} {piece}") <= max_chars:
+                    current = f"{current} {piece}".strip()
+                else:
+                    flush_current()
+                    current = piece
+            continue
+
+        candidate = f"{current} {sentence}".strip()
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            flush_current()
+            current = sentence
+
+    flush_current()
+    return chunks
+
+
+def _auto_fallback_voice_for_speaker(speaker_gender: str) -> str:
+    key = (speaker_gender or "").strip().lower()
+    style = AUTO_FALLBACK_STYLE_BY_SPEAKER.get(key, "neutral")
+    return f"preset:{style}"
+
+
+def _enforce_voice_consistency(control_instruction: str) -> str:
+    base = (control_instruction or "").strip()
+    lower = base.lower()
+    if "same speaker identity" in lower or "same voice" in lower:
+        return base
+    if base:
+        return f"{base}. {VOICE_CONSISTENCY_DIRECTIVE}"
+    return VOICE_CONSISTENCY_DIRECTIVE
+
+
+def _sanitize_text_for_tts(text: str) -> tuple[str, bool]:
+    raw = (text or "").strip()
+    if not raw:
+        return "", False
+    # Never let Khmer punctuation sign "៖" be spoken literally.
+    sanitized = raw.replace("៖", " ")
+    sanitized = " ".join(sanitized.split())
+    return sanitized, sanitized != raw
 
 
 class GenerateRequest(BaseModel):
@@ -172,6 +288,40 @@ def delete_voice(voice_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/outputs")
+def get_outputs():
+    files = _list_output_files()
+    return {"folder": str(_ensure_output_dir().resolve()), "count": len(files), "files": files}
+
+
+@app.post("/api/outputs/open-folder")
+def open_outputs_folder():
+    folder = _ensure_output_dir().resolve()
+    try:
+        if sys.platform == "win32":
+            os.startfile(str(folder))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(folder)])
+        else:
+            subprocess.Popen(["xdg-open", str(folder)])
+        return {"status": "success", "folder": str(folder)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not open folder: {e}")
+
+
+@app.delete("/api/outputs")
+def delete_outputs():
+    folder = _ensure_output_dir()
+    deleted = 0
+    for p in folder.glob("*.wav"):
+        try:
+            p.unlink()
+            deleted += 1
+        except Exception:
+            continue
+    return {"status": "success", "deleted": deleted, "folder": str(folder.resolve())}
+
+
 @app.post("/api/asr")
 def transcribe_audio(audio: UploadFile = File(...)):
     try:
@@ -227,7 +377,7 @@ def generate_audio(
                 log.add("Job started.")
                 log.add(f"Device: {demo.device}")
 
-                if effective_voice in ("none", "auto") and speaker_gender:
+                if effective_voice == "auto" and speaker_gender:
                     auto = resolve_auto_voice(speaker_gender)
                     if auto:
                         effective_voice = auto
@@ -237,10 +387,12 @@ def generate_audio(
                                 f"Auto-matched voice: {prof.get('name')} "
                                 f"({prof.get('gender', 'unknown')})"
                             )
-                    elif effective_voice == "auto":
+                    else:
+                        effective_voice = _auto_fallback_voice_for_speaker(speaker_gender)
+                        fallback_style = effective_voice.split("preset:", 1)[1]
                         log.add(
                             f"No saved voice for speaker gender «{speaker_gender}» — "
-                            "using voice design."
+                            f"using stable fallback style «{fallback_style}»."
                         )
 
                 if effective_voice.startswith("saved:"):
@@ -281,20 +433,103 @@ def generate_audio(
                     has_reference=bool(ref_wav_path),
                     profile_gender=profile_gender,
                 )
+                resolved_control = _enforce_voice_consistency(resolved_control)
                 for note in gender_notes:
                     log.add(note)
+                log.add("Voice consistency lock: enabled for all sentences/chunks.")
+                normalized_text, removed_special_sign = _sanitize_text_for_tts(text)
+                if removed_special_sign:
+                    log.add("Sanitized text: removed special sign '៖' to prevent it being spoken.")
+                text_chunks = _split_long_text_for_tts(normalized_text)
 
-                sr, wav, plan = demo.generate_tts_audio(
-                    text_input=text,
-                    control_instruction=resolved_control,
-                    reference_wav_path_input=ref_wav_path,
-                    prompt_text=prompt_text,
-                    cfg_value_input=cfg_value,
-                    do_normalize=normalize,
-                    denoise=denoise,
-                    inference_timesteps=timesteps,
-                    log=log,
-                )
+                plan_lines: list[str] = []
+                if speaker_gender:
+                    plan_lines.append(f"Speaker: {speaker_gender}")
+                if effective_voice.startswith("saved:"):
+                    prof = get_profile(effective_voice.replace("saved:", ""))
+                    plan_lines.append(f"Voice source: saved profile ({(prof or {}).get('name', 'unknown')})")
+                elif effective_voice.startswith("preset:"):
+                    plan_lines.append(f"Voice source: built-in style ({effective_voice.split('preset:', 1)[1]})")
+                else:
+                    plan_lines.append("Voice source: adaptive / auto")
+                if ref_wav_path:
+                    plan_lines.append("Reference audio: enabled")
+                if resolved_control.strip():
+                    plan_lines.append("Style control: enabled")
+                if len(text_chunks) > 1:
+                    plan_lines.append(f"Long-text mode: {len(text_chunks)} chunks")
+                if removed_special_sign:
+                    plan_lines.append("Symbol safety: removed '៖' from input before synthesis")
+                plan_lines.append(f"Timesteps: {timesteps} | CFG: {cfg_value}")
+                log_queue.put({"type": "plan", "plan": "\n".join(plan_lines)})
+
+                if len(text_chunks) > MAX_TTS_CHUNKS:
+                    raise RuntimeError(
+                        f"Text is too long for one request ({len(text_chunks)} chunks). "
+                        f"Please shorten it or use batch mode."
+                    )
+
+                if len(text_chunks) > 1:
+                    log.add(
+                        f"Long text detected: split into {len(text_chunks)} chunks "
+                        f"(~{MAX_TTS_CHUNK_CHARS} chars per chunk) for stability."
+                    )
+
+                final_sr: int | None = None
+                pieces: list[np.ndarray] = []
+                base_plan: str = ""
+                locked_ref_path: str | None = None
+
+                for idx, chunk_text in enumerate(text_chunks, start=1):
+                    if len(text_chunks) > 1:
+                        log.add(f"Chunk {idx}/{len(text_chunks)} started.")
+
+                    chunk_ref_path = ref_wav_path or locked_ref_path
+                    chunk_prompt_text = prompt_text if chunk_ref_path == ref_wav_path else ""
+                    sr, wav, plan = demo.generate_tts_audio(
+                        text_input=chunk_text,
+                        control_instruction=resolved_control,
+                        reference_wav_path_input=chunk_ref_path,
+                        prompt_text=chunk_prompt_text,
+                        cfg_value_input=cfg_value,
+                        do_normalize=normalize,
+                        denoise=denoise,
+                        inference_timesteps=timesteps,
+                        log=log,
+                    )
+                    if final_sr is None:
+                        final_sr = sr
+                    elif sr != final_sr:
+                        raise RuntimeError("Sample-rate mismatch between chunks; cannot merge safely.")
+                    pieces.append(np.asarray(wav, dtype=np.float32))
+                    if idx == 1:
+                        base_plan = plan or ""
+
+                    # When no user reference is provided, lock later chunks to chunk-1 voice.
+                    if idx == 1 and len(text_chunks) > 1 and not ref_wav_path:
+                        temp_lock_ref = Path("data") / f"temp_chunk_voice_lock_{uuid.uuid4().hex}.wav"
+                        temp_lock_ref.parent.mkdir(parents=True, exist_ok=True)
+                        sf.write(str(temp_lock_ref), wav, sr, format="WAV", subtype="PCM_16")
+                        locked_ref_path = str(temp_lock_ref)
+                        log.add("Voice lock: using chunk 1 voice as reference for remaining chunks.")
+
+                if not pieces or final_sr is None:
+                    raise RuntimeError("No audio generated.")
+
+                if len(pieces) == 1:
+                    wav = pieces[0]
+                else:
+                    pause_samples = max(1, int(final_sr * CHUNK_PAUSE_SECONDS))
+                    pause = np.zeros((pause_samples,), dtype=np.float32)
+                    joined: list[np.ndarray] = []
+                    for i, piece in enumerate(pieces):
+                        joined.append(piece)
+                        if i < len(pieces) - 1:
+                            joined.append(pause)
+                    wav = np.concatenate(joined)
+
+                sr = final_sr
+                plan = base_plan
 
                 if temp_ref_path and os.path.exists(temp_ref_path):
                     os.remove(temp_ref_path)
@@ -304,6 +539,11 @@ def generate_audio(
                 sf.write(buffer, wav, sr, format="WAV", subtype="PCM_16")
                 audio_bytes = buffer.getvalue()
                 duration = len(wav) / sr if sr else 0.0
+                out_dir = _ensure_output_dir()
+                save_name = f"sinekool_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.wav"
+                save_path = out_dir / save_name
+                with open(save_path, "wb") as wf:
+                    wf.write(audio_bytes)
 
                 log_queue.put(
                     {
@@ -315,12 +555,16 @@ def generate_audio(
                         "device": demo.device,
                         "voice_used": effective_voice,
                         "plan": plan,
-                        "text": text.strip(),
+                        "text": normalized_text,
+                        "saved_file": save_name,
+                        "saved_path": str(save_path.resolve()),
                     }
                 )
             except Exception as e:
                 log_queue.put({"type": "error", "message": str(e)})
             finally:
+                if 'locked_ref_path' in locals() and locked_ref_path and os.path.exists(locked_ref_path):
+                    os.remove(locked_ref_path)
                 if temp_ref_path and os.path.exists(temp_ref_path):
                     os.remove(temp_ref_path)
                 if torch.cuda.is_available():

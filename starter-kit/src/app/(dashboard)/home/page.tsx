@@ -30,6 +30,11 @@ import {
   MenuItem,
   Tooltip
 } from "@mui/material";
+import Dialog from "@mui/material/Dialog";
+import DialogTitle from "@mui/material/DialogTitle";
+import DialogContent from "@mui/material/DialogContent";
+import DialogContentText from "@mui/material/DialogContentText";
+import DialogActions from "@mui/material/DialogActions";
 
 const API_BASE = "http://127.0.0.1:8000/api";
 
@@ -52,6 +57,14 @@ type VoiceOption = {
 };
 
 type GenderOption = { label: string; value: string };
+type BatchStatus = "pending" | "processing" | "done" | "failed";
+type BatchItem = {
+  id: string;
+  text: string;
+  fileName: string;
+  status: BatchStatus;
+  error?: string;
+};
 
 function base64ToBlob(b64: string, mime: string): Blob {
   const bytes = atob(b64);
@@ -95,6 +108,17 @@ export default function VoxCPMStudio() {
   const [saveLastGender, setSaveLastGender] = useState("female");
   const [showSaveLast, setShowSaveLast] = useState(false);
   const [savingLast, setSavingLast] = useState(false);
+  const [outputFolder, setOutputFolder] = useState("");
+  const [outputCount, setOutputCount] = useState(0);
+  const [elapsedSec, setElapsedSec] = useState(0);
+  const [etaSec, setEtaSec] = useState<number | null>(null);
+  const [genStartedAt, setGenStartedAt] = useState<number | null>(null);
+  const [avgSecPerChar, setAvgSecPerChar] = useState(0.08);
+  const [stickyVoiceId, setStickyVoiceId] = useState("");
+  const [batchInput, setBatchInput] = useState("");
+  const [batchItems, setBatchItems] = useState<BatchItem[]>([]);
+  const [batchRunning, setBatchRunning] = useState(false);
+  const [deleteOutputsDialogOpen, setDeleteOutputsDialogOpen] = useState(false);
 
   const logBoxRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -114,7 +138,27 @@ export default function VoxCPMStudio() {
 
   useEffect(() => {
     fetchVoices();
+    void fetchOutputStats();
   }, []);
+
+  useEffect(() => {
+    // Reset auto voice lock when speaker context changes.
+    setStickyVoiceId("");
+  }, [speakerGender, audioFile]);
+
+  useEffect(() => {
+    if (voiceSelect !== "auto") setStickyVoiceId("");
+  }, [voiceSelect]);
+
+  useEffect(() => {
+    if (!loading || genStartedAt == null) return;
+    const id = window.setInterval(() => {
+      const sec = Math.max(0, Math.floor((Date.now() - genStartedAt) / 1000));
+      setElapsedSec(sec);
+      if (etaSec != null) setEtaSec(Math.max(0, etaSec - 1));
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [loading, genStartedAt, etaSec]);
 
   const fetchVoices = async () => {
     try {
@@ -126,6 +170,39 @@ export default function VoxCPMStudio() {
       console.error("Failed to fetch voices", err);
     }
   };
+
+  const fetchOutputStats = async () => {
+    try {
+      const res = await axios.get(`${API_BASE}/outputs`);
+      setOutputFolder(String(res.data.folder || ""));
+      setOutputCount(Number(res.data.count || 0));
+    } catch (err) {
+      console.error("Failed to fetch output stats", err);
+    }
+  };
+
+  const handleOpenOutputFolder = async () => {
+    try {
+      await axios.post(`${API_BASE}/outputs/open-folder`);
+      setInfo("Opened generated-audio folder.");
+    } catch (err) {
+      console.error(err);
+      setError("Could not open output folder.");
+    }
+  };
+
+  const handleDeleteAllOutputs = async () => {
+    try {
+      const res = await axios.delete(`${API_BASE}/outputs`);
+      setInfo(`Deleted ${res.data.deleted || 0} generated audio file(s).`);
+      setOutputCount(0);
+      await fetchOutputStats();
+    } catch (err) {
+      console.error(err);
+      setError("Could not delete generated audio files.");
+    }
+  };
+
 
   const handleAudioUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files?.[0]) setAudioFile(e.target.files[0]);
@@ -237,6 +314,181 @@ export default function VoxCPMStudio() {
     setInfo("Last synthesis is set as reference audio for the next run.");
   };
 
+  const slugifyFileName = (value: string, index: number) => {
+    const base = value
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 36);
+    return `${String(index + 1).padStart(3, "0")}_${base || "audio"}.wav`;
+  };
+
+  const buildBatchQueue = () => {
+    const lines = batchInput
+      .split(/\r?\n/)
+      .map(v => v.trim())
+      .filter(Boolean);
+
+    if (!lines.length) {
+      setError("Add at least one line in Batch & Queue.");
+      return;
+    }
+
+    const items: BatchItem[] = lines.map((line, i) => ({
+      id: `${Date.now()}-${i}`,
+      text: line,
+      fileName: slugifyFileName(line, i),
+      status: "pending"
+    }));
+    setBatchItems(items);
+    setInfo(`Queue created with ${items.length} item(s).`);
+  };
+
+  const updateBatchItem = (id: string, patch: Partial<BatchItem>) => {
+    setBatchItems(prev => prev.map(item => (item.id === id ? { ...item, ...patch } : item)));
+  };
+
+  const runSynthesisRequest = async (targetText: string, collectLogs: boolean) => {
+    const requestVoiceSelect = voiceSelect === "auto" && stickyVoiceId ? stickyVoiceId : voiceSelect;
+    const formData = new FormData();
+    formData.append("text", targetText);
+    formData.append("voice_select", requestVoiceSelect);
+    formData.append("speaker_gender", speakerGender);
+    formData.append("control_instruction", controlInstruction);
+    formData.append("cfg_value", cfgValue.toString());
+    formData.append("normalize", normalize.toString());
+    formData.append("denoise", denoise.toString());
+    formData.append("timesteps", timesteps.toString());
+    formData.append("prompt_text", promptText);
+    if (audioFile) formData.append("reference_audio", audioFile);
+
+    const res = await fetch(`${API_BASE}/generate`, { method: "POST", body: formData });
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`;
+      try {
+        const errBody = await res.json();
+        if (errBody.detail) detail = String(errBody.detail);
+      } catch {
+        /* ignore */
+      }
+      throw new Error(detail);
+    }
+    if (!res.body) throw new Error("No response body");
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let doneData: {
+      audio_base64?: string;
+      plan?: string;
+      duration_sec?: number;
+      device?: string;
+      sample_rate?: number;
+      logs?: string[];
+      voice_used?: string;
+    } | null = null;
+    const streamLogs: string[] = [];
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let newline = buffer.indexOf("\n");
+      while (newline >= 0) {
+        const raw = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (raw) {
+          const msg = JSON.parse(raw) as {
+            type: string;
+            line?: string;
+            message?: string;
+            audio_base64?: string;
+            plan?: string;
+            duration_sec?: number;
+            device?: string;
+            sample_rate?: number;
+            logs?: string[];
+            voice_used?: string;
+          };
+          if (msg.type === "log" && msg.line) {
+            streamLogs.push(msg.line);
+            if (collectLogs) setLogs(prev => [...prev, msg.line as string]);
+          } else if (msg.type === "plan" && msg.plan) {
+            setSynthesisPlan(String(msg.plan));
+          } else if (msg.type === "error") {
+            throw new Error(msg.message || "Synthesis failed");
+          } else if (msg.type === "done") {
+            doneData = msg;
+            if (msg.plan) setSynthesisPlan(String(msg.plan));
+          }
+        }
+        newline = buffer.indexOf("\n");
+      }
+    }
+
+    if (!doneData?.audio_base64) throw new Error("No audio returned from server");
+
+    if (collectLogs && doneData.logs?.length) setLogs(doneData.logs);
+    const blob = base64ToBlob(doneData.audio_base64, "audio/wav");
+    return {
+      blob,
+      plan: doneData.plan || "",
+      duration: doneData.duration_sec,
+      device: doneData.device,
+      sampleRate: doneData.sample_rate,
+      logs: doneData.logs || streamLogs,
+      voiceUsed: doneData.voice_used || ""
+    };
+  };
+
+  const runBatchQueue = async () => {
+    if (!batchItems.length) {
+      setError("Create a queue first.");
+      return;
+    }
+    if (batchRunning || loading) return;
+
+    setBatchRunning(true);
+    setError("");
+    setInfo("");
+    let completed = 0;
+
+    try {
+      for (const item of batchItems) {
+        if (item.status === "done") continue;
+        updateBatchItem(item.id, { status: "processing", error: "" });
+        try {
+          const result = await runSynthesisRequest(item.text, false);
+          const url = URL.createObjectURL(result.blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = item.fileName;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+          updateBatchItem(item.id, { status: "done" });
+          completed += 1;
+        } catch (err: unknown) {
+          updateBatchItem(item.id, {
+            status: "failed",
+            error: err instanceof Error ? err.message : "Generation failed"
+          });
+        }
+      }
+      await fetchOutputStats();
+      setInfo(`Batch complete: ${completed}/${batchItems.length} generated.`);
+    } finally {
+      setBatchRunning(false);
+    }
+  };
+
+  const resetBatchQueue = () => {
+    if (batchRunning) return;
+    setBatchItems([]);
+    setBatchInput("");
+  };
+
   const handleGenerate = async () => {
     if (!text.trim()) {
       setError("Please enter some text to synthesize.");
@@ -251,89 +503,38 @@ export default function VoxCPMStudio() {
     setSynthesisPlan("");
     setLastMeta(null);
     setShowSaveLast(false);
+    const startMs = Date.now();
+    setGenStartedAt(startMs);
+    setElapsedSec(0);
+    const estimated = Math.max(4, Math.round(text.trim().length * avgSecPerChar * (timesteps / 10)));
+    setEtaSec(estimated);
+    let finishedOk = false;
 
     try {
-      const formData = new FormData();
-      formData.append("text", text);
-      formData.append("voice_select", voiceSelect);
-      formData.append("speaker_gender", speakerGender);
-      formData.append("control_instruction", controlInstruction);
-      formData.append("cfg_value", cfgValue.toString());
-      formData.append("normalize", normalize.toString());
-      formData.append("denoise", denoise.toString());
-      formData.append("timesteps", timesteps.toString());
-      formData.append("prompt_text", promptText);
-      if (audioFile) formData.append("reference_audio", audioFile);
-
-      const res = await fetch(`${API_BASE}/generate`, { method: "POST", body: formData });
-      if (!res.ok) {
-        let detail = `HTTP ${res.status}`;
-        try {
-          const errBody = await res.json();
-          if (errBody.detail) detail = String(errBody.detail);
-        } catch {
-          /* ignore */
-        }
-        throw new Error(detail);
+      const result = await runSynthesisRequest(text.trim(), true);
+      if (voiceSelect === "auto" && result.voiceUsed) {
+        setStickyVoiceId(result.voiceUsed);
       }
-      if (!res.body) throw new Error("No response body");
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let doneData: Record<string, unknown> | null = null;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        let newline = buffer.indexOf("\n");
-        while (newline >= 0) {
-          const raw = buffer.slice(0, newline).trim();
-          buffer = buffer.slice(newline + 1);
-          if (raw) {
-            const msg = JSON.parse(raw) as {
-              type: string;
-              line?: string;
-              message?: string;
-              audio_base64?: string;
-              plan?: string;
-              duration_sec?: number;
-              device?: string;
-              sample_rate?: number;
-              logs?: string[];
-            };
-            if (msg.type === "log" && msg.line) {
-              setLogs(prev => [...prev, msg.line as string]);
-            } else if (msg.type === "error") {
-              throw new Error(msg.message || "Synthesis failed");
-            } else if (msg.type === "done") {
-              doneData = msg;
-              if (msg.logs?.length) setLogs(msg.logs);
-              if (msg.plan) setSynthesisPlan(msg.plan);
-            }
-          }
-          newline = buffer.indexOf("\n");
-        }
-      }
-
-      if (!doneData?.audio_base64) {
-        throw new Error("No audio returned from server");
-      }
-
-      const blob = base64ToBlob(doneData.audio_base64 as string, "audio/wav");
+      if (result.plan) setSynthesisPlan(result.plan);
+      const blob = result.blob;
       const file = new File([blob], `synthesis_${Date.now()}.wav`, { type: "audio/wav" });
       setLastAudioFile(file);
       setSaveLastName(text.trim().slice(0, 40) || "My voice");
       setSaveLastGender(speakerGender);
       setLastMeta({
-        duration: doneData.duration_sec as number | undefined,
-        device: doneData.device as string | undefined,
-        sampleRate: doneData.sample_rate as number | undefined
+        duration: result.duration,
+        device: result.device,
+        sampleRate: result.sampleRate
       });
+      const actualSec = Math.max(1, Math.round((Date.now() - startMs) / 1000));
+      const chars = Math.max(1, text.trim().length);
+      const normalized = actualSec / chars / Math.max(0.5, timesteps / 10);
+      setAvgSecPerChar(prev => prev * 0.7 + normalized * 0.3);
 
       if (audioUrl) URL.revokeObjectURL(audioUrl);
       setAudioUrl(URL.createObjectURL(blob));
+      await fetchOutputStats();
+      finishedOk = true;
     } catch (err: unknown) {
       console.error("Generation error:", err);
       const detail = err instanceof Error ? err.message : "request failed";
@@ -341,21 +542,27 @@ export default function VoxCPMStudio() {
       setLogs(prev => [...prev, `[…] Error: ${detail}`]);
     } finally {
       setLoading(false);
+      setEtaSec(null);
+      setGenStartedAt(null);
+      if (finishedOk) {
+        // Keep UI clean after successful completion.
+        setLogs([]);
+      }
     }
   };
 
   const selectedVoice = pickerOptions.find(v => v.id === voiceSelect) || AUTO_VOICE;
+  const lockedVoiceLabel = pickerOptions.find(v => v.id === stickyVoiceId)?.name || stickyVoiceId;
 
   return (
-    <Box sx={{ flexGrow: 1, p: 3 }}>
+    <Box sx={{ flexGrow: 1, p: { xs: 2, md: 3 } }}>
       <Typography
         variant="h4"
         sx={{
-          mb: 4,
-          fontWeight: "bold",
-          background: "-webkit-linear-gradient(45deg, #7C4DFF 30%, #448AFF 90%)",
-          WebkitBackgroundClip: "text",
-          WebkitTextFillColor: "transparent"
+          mb: 3,
+          fontWeight: 800,
+          color: "text.primary",
+          letterSpacing: 0.2
         }}
       >
         {STUDIO_NAME}
@@ -440,6 +647,11 @@ export default function VoxCPMStudio() {
                   {matchedProfile
                     ? `Will clone: ${matchedProfile.name} (${GENDER_LABELS[matchedProfile.gender || "unknown"]})`
                     : `No saved ${GENDER_LABELS[speakerGender] || speakerGender} clone — using voice design for a ${GENDER_LABELS[speakerGender] || speakerGender} speaker. Upload reference audio to clone a specific voice.`}
+                </Alert>
+              )}
+              {voiceSelect === "auto" && stickyVoiceId && (
+                <Alert severity="success" sx={{ mb: 2 }}>
+                  Voice lock is active for consistency: {lockedVoiceLabel}
                 </Alert>
               )}
 
@@ -590,42 +802,131 @@ export default function VoxCPMStudio() {
         </Grid>
 
         <Grid item xs={12} md={4}>
-          <Card elevation={3} sx={{ borderRadius: 3, height: "100%", display: "flex", flexDirection: "column" }}>
-            <CardContent sx={{ flexGrow: 1, display: "flex", flexDirection: "column" }}>
-              <Typography variant="h6" sx={{ mb: 3 }}>Output</Typography>
+          <Card
+            elevation={2}
+            sx={{
+              borderRadius: 3,
+              border: theme => `1px solid ${theme.palette.divider}`,
+              backgroundImage: "none"
+            }}
+          >
+            <CardContent sx={{ p: { xs: 2, sm: 2.5 } }}>
+              <Typography variant="h6" sx={{ mb: 1.5, fontWeight: 700, lineHeight: 1.2 }}>Output</Typography>
               <Button
                 variant="contained"
                 size="large"
                 fullWidth
                 onClick={handleGenerate}
-                disabled={loading}
+                disabled={loading || batchRunning}
                 sx={{
-                  mb: 2,
-                  py: 1.5,
-                  background: "linear-gradient(135deg, #7C4DFF 0%, #448AFF 100%)",
-                  fontWeight: "bold",
-                  fontSize: "1.1rem"
+                  mb: 1.25,
+                  py: 1.25,
+                  fontWeight: 700,
+                  fontSize: "1rem",
+                  borderRadius: 2,
+                  boxShadow: "none",
+                  textTransform: "none",
+                  "&:hover": {
+                    boxShadow: "none"
+                  }
                 }}
               >
                 {loading ? <CircularProgress size={26} color="inherit" /> : "Synthesize Audio"}
               </Button>
+              <Box
+                sx={{
+                  mb: 1.25,
+                  minHeight: 22,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 0.75
+                }}
+              >
+                <Box
+                  sx={{
+                    width: 8,
+                    height: 8,
+                    borderRadius: "50%",
+                    bgcolor: loading ? "warning.main" : "success.main",
+                    flexShrink: 0
+                  }}
+                />
+                <Typography variant="caption" color="text.secondary" sx={{ lineHeight: 1.2 }}>
+                  {loading
+                    ? `Elapsed: ${elapsedSec}s${etaSec != null ? ` · ETA: ~${etaSec}s` : ""}`
+                    : "Ready"}
+                </Typography>
+              </Box>
+              <Box sx={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 1, mb: 1.25 }}>
+                <Button
+                  variant="contained"
+                  size="small"
+                  onClick={handleOpenOutputFolder}
+                  sx={{
+                    borderRadius: 1.5,
+                    width: "100%",
+                    minHeight: 32,
+                    whiteSpace: "nowrap",
+                    textTransform: "none",
+                    fontWeight: 600
+                  }}
+                >
+                  Open folder
+                </Button>
+                <Button
+                  variant="outlined"
+                  color="error"
+                  size="small"
+                  onClick={() => setDeleteOutputsDialogOpen(true)}
+                  sx={{
+                    borderRadius: 1.5,
+                    width: "100%",
+                    minHeight: 32,
+                    whiteSpace: "nowrap",
+                    textTransform: "none",
+                    fontWeight: 600
+                  }}
+                >
+                  Delete all
+                </Button>
+                <Button
+                  variant="outlined"
+                  color="secondary"
+                  size="small"
+                  onClick={() => void fetchOutputStats()}
+                  sx={{
+                    gridColumn: "1 / -1",
+                    borderRadius: 1.5,
+                    width: "100%",
+                    minHeight: 32,
+                    whiteSpace: "nowrap",
+                    textTransform: "none",
+                    fontWeight: 600
+                  }}
+                >
+                  Refresh
+                </Button>
+              </Box>
+              <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 1.25, fontSize: "0.72rem" }}>
+                Saved files: {outputCount}{outputFolder ? ` · ${outputFolder}` : ""}
+              </Typography>
 
-              <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: "bold" }}>
+              <Typography variant="subtitle2" sx={{ mb: 0.75, fontWeight: 700 }}>
                 Process log
               </Typography>
               <Box
                 ref={logBoxRef}
                 sx={{
-                  mb: 2,
-                  maxHeight: 180,
+                  mb: 1.5,
+                  maxHeight: 140,
                   overflowY: "auto",
                   overflowX: "hidden",
-                  bgcolor: "#0d1117",
-                  color: "#c9d1d9",
+                  bgcolor: "background.default",
+                  color: "text.primary",
                   borderRadius: 2,
-                  p: 1.5,
-                  fontFamily: "monospace",
-                  fontSize: "0.75rem",
+                  p: 1.25,
+                  fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+                  fontSize: "0.72rem",
                   lineHeight: 1.5,
                   border: "1px solid",
                   borderColor: "divider",
@@ -633,17 +934,50 @@ export default function VoxCPMStudio() {
                 }}
               >
                 {logs.length === 0 && loading ? (
-                  <Typography variant="caption" sx={{ color: "#8b949e" }}>
+                  <Typography variant="caption" color="text.secondary">
                     Waiting for server…
                   </Typography>
                 ) : logs.length === 0 ? (
-                  <Typography variant="caption" sx={{ color: "#8b949e" }}>
+                  <Typography variant="caption" color="text.secondary">
                     Logs appear here while synthesizing…
                   </Typography>
                 ) : (
                   logs.map((line, i) => <Box key={i}>{line}</Box>)
                 )}
               </Box>
+              {synthesisPlan && (
+                <Box
+                  sx={{
+                    mb: 1.25,
+                    p: 1.25,
+                    borderRadius: 2,
+                    bgcolor: "action.hover",
+                    border: "1px solid",
+                    borderColor: "divider",
+                    maxHeight: 170,
+                    overflowY: "auto",
+                    overflowX: "hidden"
+                  }}
+                >
+                  <Typography variant="caption" sx={{ display: "block", mb: 0.5, fontWeight: 700 }}>
+                    Synthesis plan
+                  </Typography>
+                  <Typography
+                    variant="caption"
+                    component="pre"
+                    sx={{
+                      m: 0,
+                      whiteSpace: "pre-wrap",
+                      display: "block",
+                      color: "text.secondary",
+                      fontFamily: "inherit",
+                      lineHeight: 1.45
+                    }}
+                  >
+                    {synthesisPlan}
+                  </Typography>
+                </Box>
+              )}
 
               {lastMeta && (
                 <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 2 }}>
@@ -655,16 +989,16 @@ export default function VoxCPMStudio() {
 
               <Box
                 sx={{
-                  mb: 2,
-                  bgcolor: "background.default",
+                  mb: 1.5,
+                  bgcolor: "background.paper",
                   borderRadius: 2,
-                  p: 2,
+                  p: 1.5,
                   display: "flex",
                   alignItems: "center",
                   justifyContent: "center",
                   border: "1px dashed",
                   borderColor: "divider",
-                  minHeight: 80
+                  minHeight: 78
                 }}
               >
                 {audioUrl ? (
@@ -731,24 +1065,182 @@ export default function VoxCPMStudio() {
                 </Box>
               )}
 
-              {synthesisPlan && (
-                <Box sx={{ mt: 2 }}>
-                  <Typography variant="caption" color="text.secondary" fontWeight="bold">
-                    Synthesis plan
-                  </Typography>
-                  <Typography
-                    variant="caption"
-                    component="pre"
-                    sx={{ whiteSpace: "pre-wrap", mt: 0.5, display: "block", color: "text.secondary" }}
-                  >
-                    {synthesisPlan}
+            </CardContent>
+          </Card>
+          <Card
+            elevation={2}
+            sx={{
+              mt: 1.5,
+              borderRadius: 3,
+              border: theme => `1px solid ${theme.palette.divider}`,
+              overflow: "hidden",
+              // Hide injected writing-assistant overlays inside this card only.
+              "& grammarly-desktop-integration, & grammarly-extension": { display: "none !important" },
+              "& [class*='grammarly'], & [id*='grammarly']": { display: "none !important" },
+              "& [class*='lt-'], & [id*='lt-'], & [data-lt-active='true']": { display: "none !important" }
+            }}
+          >
+            <CardContent sx={{ p: { xs: 2, sm: 2.5 } }}>
+              <Typography variant="h6" sx={{ mb: 1, fontWeight: 700 }}>
+                Batch & Queue
+              </Typography>
+              <Typography
+                variant="caption"
+                color="text.secondary"
+                sx={{ display: "block", mb: 0.75, lineHeight: 1.35, wordBreak: "break-word", fontSize: "0.72rem" }}
+              >
+                One line = one generation job.
+              </Typography>
+              <Typography
+                variant="caption"
+                color="text.secondary"
+                sx={{ display: "block", mb: 1, lineHeight: 1.35, wordBreak: "break-word", fontSize: "0.72rem" }}
+              >
+                Paste lines, then click Build Queue and Run Queue.
+              </Typography>
+              <TextField
+                fullWidth
+                multiline
+                minRows={4}
+                maxRows={10}
+                placeholder={"Line 1 text...\nLine 2 text...\nLine 3 text..."}
+                value={batchInput}
+                onChange={e => setBatchInput(e.target.value)}
+                inputProps={{
+                  spellCheck: false,
+                  autoComplete: "off",
+                  autoCorrect: "off",
+                  autoCapitalize: "off",
+                  "data-gramm": "false",
+                  "data-gramm_editor": "false",
+                  "data-enable-grammarly": "false",
+                  "data-lt-active": "false",
+                  "data-ms-editor": "false"
+                }}
+                sx={{
+                  mb: 1,
+                  "& .MuiInputBase-root": { overflow: "hidden" },
+                  "& textarea": { position: "relative", zIndex: 2 }
+                }}
+              />
+              <Box
+                sx={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+                  gap: 1,
+                  mb: 1
+                }}
+              >
+                <Button
+                  size="small"
+                  variant="outlined"
+                  onClick={buildBatchQueue}
+                  disabled={batchRunning}
+                  sx={{ minHeight: 32, textTransform: "none", fontWeight: 600 }}
+                >
+                  Build Queue
+                </Button>
+                <Button
+                  size="small"
+                  variant="contained"
+                  onClick={runBatchQueue}
+                  disabled={batchRunning || loading || batchItems.length === 0}
+                  sx={{ minHeight: 32, textTransform: "none", fontWeight: 600 }}
+                >
+                  {batchRunning ? "Processing..." : "Run Queue"}
+                </Button>
+                <Button
+                  size="small"
+                  variant="text"
+                  color="inherit"
+                  onClick={resetBatchQueue}
+                  disabled={batchRunning}
+                  sx={{ gridColumn: "1 / -1", minHeight: 30, textTransform: "none", fontWeight: 600 }}
+                >
+                  Clear
+                </Button>
+              </Box>
+              {batchItems.length > 0 && (
+                <Box sx={{ mb: 1.25 }}>
+                  <LinearProgress
+                    variant="determinate"
+                    value={(batchItems.filter(i => i.status === "done").length / batchItems.length) * 100}
+                    sx={{ mb: 0.75, height: 6, borderRadius: 3 }}
+                  />
+                  <Typography variant="caption" color="text.secondary">
+                    {batchItems.filter(i => i.status === "done").length}/{batchItems.length} completed
                   </Typography>
                 </Box>
               )}
+              <Box sx={{ maxHeight: 180, overflowY: "auto", border: "1px solid", borderColor: "divider", borderRadius: 2, p: 1 }}>
+                {batchItems.length === 0 ? (
+                  <Typography variant="caption" color="text.secondary">
+                    Queue items will appear here.
+                  </Typography>
+                ) : (
+                  batchItems.map(item => (
+                    <Box key={item.id} sx={{ py: 0.75, borderBottom: "1px solid", borderBottomColor: "divider", "&:last-child": { borderBottom: 0 } }}>
+                      <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 1 }}>
+                        <Typography variant="caption" sx={{ fontWeight: 600, color: "text.primary" }}>
+                          {item.fileName}
+                        </Typography>
+                        <Chip
+                          size="small"
+                          label={item.status}
+                          color={
+                            item.status === "done"
+                              ? "success"
+                              : item.status === "failed"
+                                ? "error"
+                                : item.status === "processing"
+                                  ? "warning"
+                                  : "default"
+                          }
+                        />
+                      </Box>
+                      <Typography variant="caption" color="text.secondary">
+                        {item.text}
+                      </Typography>
+                      {item.error && (
+                        <Typography variant="caption" color="error.main" sx={{ display: "block" }}>
+                          {item.error}
+                        </Typography>
+                      )}
+                    </Box>
+                  ))
+                )}
+              </Box>
             </CardContent>
           </Card>
         </Grid>
       </Grid>
+      <Dialog
+        open={deleteOutputsDialogOpen}
+        onClose={() => setDeleteOutputsDialogOpen(false)}
+        aria-labelledby="delete-generated-audio-title"
+      >
+        <DialogTitle id="delete-generated-audio-title">Delete all generated audio?</DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            This will permanently remove all generated `.wav` files in your output folder.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setDeleteOutputsDialogOpen(false)} color="inherit">
+            Cancel
+          </Button>
+          <Button
+            color="error"
+            variant="contained"
+            onClick={async () => {
+              setDeleteOutputsDialogOpen(false);
+              await handleDeleteAllOutputs();
+            }}
+          >
+            Delete all
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 }

@@ -9,8 +9,7 @@ data/license.json
 data/license_admin_config.json
 data/license_issued_log.json
 data/bin/
-data/video_outputs/
-data/video_temp/
+data/generated_audio/
 app_local.py
 .venv/
 starter-kit/node_modules/
