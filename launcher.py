@@ -42,54 +42,53 @@ MAX_LOG_LINES = 400
 
 STUDIO_CSS = """
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap');
   body, .nicegui-content {
-    background: radial-gradient(1200px 600px at 10% -10%, #1a2744 0%, transparent 55%),
-                radial-gradient(900px 500px at 100% 0%, #2a1848 0%, transparent 50%),
+    background: radial-gradient(900px 400px at 10% -10%, #1a2744 0%, transparent 55%),
+                radial-gradient(700px 350px at 100% 0%, #2a1848 0%, transparent 50%),
                 #080a0f !important;
     font-family: 'Inter', 'Segoe UI', sans-serif !important;
+    font-size: 13px;
   }
-  .studio-shell { max-width: 1040px; margin: 0 auto; padding: 20px 20px 28px; }
+  .studio-shell { max-width: 760px; margin: 0 auto; padding: 10px 12px 12px; }
   .studio-hero {
-    background: linear-gradient(135deg, rgba(79,140,255,0.18), rgba(124,92,255,0.12));
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 18px;
-    padding: 18px 22px;
-    margin-bottom: 16px;
-    box-shadow: 0 8px 32px rgba(0,0,0,0.35);
+    background: linear-gradient(135deg, rgba(79,140,255,0.14), rgba(124,92,255,0.08));
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 10px;
+    padding: 8px 12px;
+    margin-bottom: 8px;
   }
   .studio-card {
     background: rgba(18, 20, 28, 0.92) !important;
     border: 1px solid rgba(255,255,255,0.07) !important;
-    border-radius: 16px !important;
-    box-shadow: 0 4px 24px rgba(0,0,0,0.28);
-    backdrop-filter: blur(8px);
+    border-radius: 10px !important;
+    box-shadow: none !important;
   }
   .studio-section-title {
-    font-size: 0.72rem;
-    letter-spacing: 0.12em;
+    font-size: 0.65rem;
+    letter-spacing: 0.1em;
     text-transform: uppercase;
     color: #8b949e;
     font-weight: 600;
-    margin-bottom: 10px;
+    margin-bottom: 6px;
   }
-  .studio-subtitle { color: #9aa4b2; font-size: 0.9rem; }
+  .studio-subtitle { color: #9aa4b2; font-size: 0.78rem; }
   .studio-version {
     background: rgba(255,255,255,0.06);
     border: 1px solid rgba(255,255,255,0.08);
     border-radius: 999px;
-    padding: 4px 12px;
-    font-size: 0.75rem;
+    padding: 2px 8px;
+    font-size: 0.68rem;
     color: #c9d1d9;
   }
   .status-pill {
     display: inline-flex;
     align-items: center;
-    gap: 8px;
-    padding: 8px 14px;
+    gap: 6px;
+    padding: 4px 10px;
     border-radius: 999px;
     font-weight: 600;
-    font-size: 0.9rem;
+    font-size: 0.78rem;
   }
   .status-pill.running {
     background: rgba(63,185,80,0.15);
@@ -102,38 +101,49 @@ STUDIO_CSS = """
     border: 1px solid rgba(255,255,255,0.08);
   }
   .status-dot {
-    width: 8px; height: 8px; border-radius: 50%;
+    width: 6px; height: 6px; border-radius: 50%;
     background: currentColor;
-    box-shadow: 0 0 10px currentColor;
   }
   .check-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-    gap: 10px;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
     width: 100%;
   }
+  @media (max-width: 700px) { .check-grid { grid-template-columns: repeat(2, 1fr); } }
   .check-tile {
-    border-radius: 12px;
-    padding: 12px 14px;
+    border-radius: 8px;
+    padding: 6px 8px;
     border: 1px solid rgba(255,255,255,0.06);
     background: rgba(255,255,255,0.02);
-    min-height: 72px;
+    min-height: 0;
   }
-  .check-tile.ok { border-color: rgba(63,185,80,0.25); background: rgba(63,185,80,0.06); }
-  .check-tile.warn { border-color: rgba(210,153,34,0.25); background: rgba(210,153,34,0.06); }
-  .check-tile.fail { border-color: rgba(248,81,73,0.25); background: rgba(248,81,73,0.06); }
-  .check-label { font-weight: 600; font-size: 0.88rem; color: #e6edf3; }
-  .check-detail { font-size: 0.78rem; color: #8b949e; margin-top: 2px; word-break: break-word; }
+  .check-tile.ok { border-color: rgba(63,185,80,0.22); background: rgba(63,185,80,0.05); }
+  .check-tile.warn { border-color: rgba(210,153,34,0.22); background: rgba(210,153,34,0.05); }
+  .check-tile.fail { border-color: rgba(248,81,73,0.22); background: rgba(248,81,73,0.05); }
+  .check-label { font-weight: 600; font-size: 0.75rem; color: #e6edf3; line-height: 1.2; }
+  .check-detail {
+    font-size: 0.68rem; color: #8b949e; margin-top: 1px;
+    word-break: break-word; line-height: 1.25;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
   .log-panel {
     background: #0b0e14;
     border: 1px solid rgba(255,255,255,0.06);
-    border-radius: 12px;
+    border-radius: 8px;
     font-family: 'JetBrains Mono', Consolas, monospace;
-    font-size: 0.78rem;
+    font-size: 0.68rem;
   }
-  .log-line { line-height: 1.5; padding: 1px 0; }
-  .cta-row .q-btn { min-height: 44px; font-weight: 600; }
-  .license-big { font-size: 1.55rem; font-weight: 700; line-height: 1.2; }
+  .log-line { line-height: 1.35; padding: 0; }
+  .studio-shell .q-btn {
+    min-height: 30px !important;
+    font-size: 0.78rem !important;
+    padding: 0 10px !important;
+  }
+  .studio-shell .q-btn .q-icon { font-size: 1rem !important; }
+  .license-big { font-size: 1.05rem; font-weight: 700; line-height: 1.2; }
+  .studio-shell .q-expansion-item { font-size: 0.82rem; }
+  .compact-pad { padding: 10px 12px !important; }
 </style>
 """
 
@@ -339,72 +349,82 @@ def build_ui() -> None:
                 ),
             ).props("outline")
 
-    with ui.column().classes("studio-shell w-full gap-4"):
-        # Hero header
+    with ui.column().classes("studio-shell w-full gap-2"):
         with ui.element("div").classes("studio-hero w-full"):
-            with ui.row().classes("w-full items-center justify-between gap-4"):
-                with ui.row().classes("items-center gap-4"):
+            with ui.row().classes("w-full items-center justify-between gap-2"):
+                with ui.row().classes("items-center gap-2"):
                     if LOGO_HEADER.is_file():
-                        ui.image(str(LOGO_HEADER)).classes("h-12")
+                        ui.image(str(LOGO_HEADER)).classes("h-8")
                     elif ICON_PNG.is_file():
-                        ui.image(str(ICON_PNG)).classes("h-12")
+                        ui.image(str(ICON_PNG)).classes("h-8")
                     with ui.column().classes("gap-0"):
-                        ui.label(STUDIO_NAME).classes("text-h5 font-bold tracking-tight")
-                        ui.label("Professional voice studio · one-click setup").classes("studio-subtitle")
-                with ui.column().classes("items-end gap-1"):
-                    ui_refs["version_label"] = ui.label(f"v{get_studio_release_version()}").classes("studio-version")
+                        ui.label(STUDIO_NAME).classes("text-subtitle1 font-bold leading-tight")
+                        ui.label("Voice studio").classes("studio-subtitle")
+                with ui.row().classes("items-center gap-2"):
                     ui_refs["update_label"] = ui.label("").classes("text-caption text-warning")
+                    ui_refs["version_label"] = ui.label(f"v{get_studio_release_version()}").classes("studio-version")
 
-        # License + quick actions
-        with ui.row().classes("w-full gap-4 flex-col md:flex-row"):
+        with ui.row().classes("w-full gap-2"):
             @ui.refreshable
             def license_panel() -> None:
                 status = current_license_status()
                 tone, label = _license_tone(status)
-                with ui.card().classes("studio-card flex-grow p-5"):
+                with ui.card().classes("studio-card compact-pad flex-grow"):
                     ui.label("License").classes("studio-section-title")
-                    with ui.row().classes("w-full items-start justify-between gap-3"):
-                        with ui.column().classes("gap-1"):
-                            ui.badge(label, color=tone).props("outline")
+                    with ui.row().classes("w-full items-center justify-between gap-2"):
+                        with ui.column().classes("gap-0"):
+                            ui.badge(label, color=tone).props("outline dense")
                             if status.ok:
                                 ui.label(status.remaining_label or "—").classes("license-big")
-                                ui.label(f"Expires {status.expires or '—'}").classes("studio-subtitle")
+                                exp = f"Expires {status.expires}" if status.expires else ""
                                 if status.source:
-                                    ui.label(f"Type · {status.source}").classes("text-caption text-grey")
+                                    exp = f"{exp} · {status.source}" if exp else status.source
+                                if exp:
+                                    ui.label(exp).classes("text-caption text-grey")
                             else:
-                                ui.label(LICENSE_CONTACT_HINT).classes("studio-subtitle")
-                                ui.label("Activate to start Studio and open the UI").classes("text-caption text-grey")
-                        ui.button("Enter license", icon="vpn_key", on_click=license_dialog.open).props(
-                            "outline color=primary"
+                                ui.label("Not activated").classes("studio-subtitle")
+                        ui.button("License", icon="vpn_key", on_click=license_dialog.open).props(
+                            "dense outline color=primary"
                         )
                     if status.ok and status.remaining_days is not None and status.expires != "dev":
                         ui.linear_progress(
                             value=min(1.0, max(0.0, status.remaining_days / 365)),
                             show_value=False,
-                        ).props(f'color="{tone}" rounded').classes("mt-3")
+                        ).props(f'color="{tone}" rounded dense').classes("mt-1")
 
             ui_refs["license_panel"] = license_panel
             license_panel()
 
-            with ui.card().classes("studio-card p-5 min-w-[240px]"):
-                ui.label("Quick actions").classes("studio-section-title")
-                with ui.column().classes("gap-2 w-full"):
-                    ui_refs["setup_btn"] = ui.button(
-                        "Run setup", icon="build", on_click=lambda: run_setup()
-                    ).props("unelevated color=primary").classes("w-full")
-                    ui.button("Refresh checks", icon="refresh", on_click=lambda: refresh_checks()).props(
-                        "outline"
-                    ).classes("w-full")
-                    ui.button(
-                        "Check updates", icon="system_update", on_click=lambda: check_updates(manual=True)
-                    ).props("outline").classes("w-full")
-                    ui.button(
-                        "Get license", icon="chat", on_click=lambda: webbrowser.open(LICENSE_CONTACT_URL)
-                    ).props("flat color=primary").classes("w-full")
+            with ui.card().classes("studio-card compact-pad"):
+                ui.label("Studio").classes("studio-section-title")
+                ui_refs["server_status"] = ui.html(
+                    '<div class="status-pill stopped"><span class="status-dot"></span>Stopped</div>'
+                )
+                with ui.row().classes("gap-1 mt-1"):
+                    ui.button("Start", icon="play_arrow", on_click=lambda: start_studio()).props(
+                        "dense unelevated color=positive"
+                    )
+                    ui.button("Stop", icon="stop", on_click=lambda: stop_servers()).props(
+                        "dense outline color=negative"
+                    )
+                    ui.button("Open UI", icon="open_in_new", on_click=lambda: open_ui()).props(
+                        "dense outline color=primary"
+                    )
 
-        # Requirements grid
-        with ui.card().classes("studio-card w-full p-5"):
-            ui.label("System requirements").classes("studio-section-title")
+        with ui.row().classes("w-full gap-1 flex-wrap"):
+            ui_refs["setup_btn"] = ui.button("Setup", icon="build", on_click=lambda: run_setup()).props(
+                "dense unelevated color=primary"
+            )
+            ui.button("Refresh", icon="refresh", on_click=lambda: refresh_checks()).props("dense outline")
+            ui.button("Updates", icon="system_update", on_click=lambda: check_updates(manual=True)).props(
+                "dense outline"
+            )
+            ui.button("Get license", icon="chat", on_click=lambda: webbrowser.open(LICENSE_CONTACT_URL)).props(
+                "dense flat color=primary"
+            )
+
+        with ui.card().classes("studio-card compact-pad w-full"):
+            ui.label("Requirements").classes("studio-section-title")
             checks_host = ui.element("div").classes("check-grid w-full")
 
             @ui.refreshable
@@ -425,41 +445,22 @@ def build_ui() -> None:
             ui_refs["checks_panel"] = checks_panel
             checks_panel()
 
-        # Studio control
-        with ui.card().classes("studio-card w-full p-5"):
-            ui.label("Studio control").classes("studio-section-title")
-            with ui.row().classes("w-full items-center justify-between flex-wrap gap-4"):
-                ui_refs["server_status"] = ui.html(
-                    '<div class="status-pill stopped"><span class="status-dot"></span>Stopped</div>'
-                )
-                with ui.row().classes("gap-2 cta-row"):
-                    ui.button("Open UI", icon="open_in_new", on_click=lambda: open_ui()).props(
-                        "outline color=primary"
-                    )
-                    ui.button("Stop", icon="stop_circle", on_click=lambda: stop_servers()).props(
-                        "outline color=negative"
-                    )
-                    ui.button("Start Studio", icon="play_circle", on_click=lambda: start_studio()).props(
-                        "unelevated color=positive"
-                    ).classes("px-6")
-
-        # Activity log
-        with ui.expansion("Activity log", icon="terminal", value=True).classes("studio-card w-full"):
-            ui_refs["activity_label"] = ui.label("Idle").classes("text-body2 font-medium")
+        with ui.expansion("Activity log", icon="terminal", value=False).classes("studio-card w-full"):
+            ui_refs["activity_label"] = ui.label("Idle").classes("text-caption font-medium")
             ui_refs["progress_bar"] = ui.linear_progress(value=0, show_value=False).props(
-                "color=primary rounded"
+                "color=primary rounded dense"
             )
             with ui.row().classes("w-full items-center justify-between"):
                 ui_refs["progress_pct_label"] = ui.label("").classes("text-caption text-primary")
-                ui_refs["progress_detail_label"] = ui.label("").classes("text-caption text-grey log-line")
-            ui.button("Clear log", icon="delete_sweep", on_click=lambda: clear_log()).props("flat dense")
-            log_scroll = ui.scroll_area().classes("log-panel w-full h-52 p-3 mt-2")
+                ui.button("Clear", icon="delete_outline", on_click=lambda: clear_log()).props("flat dense")
+            ui_refs["progress_detail_label"] = ui.label("").classes("text-caption text-grey log-line")
+            log_scroll = ui.scroll_area().classes("log-panel w-full h-24 p-2 mt-1")
             with log_scroll:
                 ui_refs["log_column"] = ui.column().classes("w-full gap-0")
 
-        with ui.row().classes("w-full justify-between items-center text-caption text-grey pt-1"):
+        with ui.row().classes("w-full justify-between items-center text-caption text-grey"):
             ui.label(f"Support · {LICENSE_CONTACT_LABEL}")
-            ui.link("Telegram", LICENSE_CONTACT_URL).classes("text-primary")
+            ui.link("Telegram", LICENSE_CONTACT_URL).classes("text-primary text-caption")
 
     # --- handlers ---
     def rebuild_log_view() -> None:
@@ -736,7 +737,7 @@ def main() -> None:
         port=LAUNCHER_PORT,
         reload=False,
         title=STUDIO_NAME,
-        window_size=(980, 900),
+        window_size=(780, 640),
         favicon=favicon,
         show_welcome_message=False,
     )
