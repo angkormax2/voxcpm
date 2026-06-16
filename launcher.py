@@ -20,7 +20,9 @@ from studio_branding import (
     LICENSE_CONTACT_LABEL,
     LICENSE_CONTACT_URL,
     STUDIO_NAME,
+    get_studio_release_version,
 )
+from studio_update import UpdateStatus, apply_git_update, check_for_updates
 from launcher_core import (
     PROJECT_ROOT,
     StudioManager,
@@ -63,6 +65,7 @@ class StudioLauncherApp:
         self._setup_started = False
         self._log_visible = False
         self._servers_up = False
+        self._update_status: UpdateStatus | None = None
 
         self._set_window_icon()
         self._build_main_ui()
@@ -73,6 +76,7 @@ class StudioLauncherApp:
         self.root.after(3000, self._poll_server_status)
         self.root.after(1000, self._poll_access_status)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(5000, self._check_updates_quiet)
 
         self._enqueue_log(f"Welcome to {STUDIO_NAME}")
         self._refresh_license_panel()
@@ -399,6 +403,9 @@ class StudioLauncherApp:
             side="left", padx=(0, 8)
         )
         ttk.Button(btn_row, text="Get a license", command=self._open_license_contact).pack(side="left")
+        ttk.Button(btn_row, text="Check for updates", command=lambda: self._check_updates(manual=True)).pack(
+            side="left", padx=(8, 0)
+        )
 
         srv_row = tk.Frame(self.root, bg=BG)
         srv_row.pack(fill="x", padx=16, pady=8)
@@ -445,6 +452,22 @@ class StudioLauncherApp:
 
         foot = tk.Frame(self.root, bg=BG)
         foot.pack(fill="x", padx=16, pady=(8, 10))
+        self._version_var = tk.StringVar(value=f"v{get_studio_release_version()}")
+        tk.Label(
+            foot,
+            textvariable=self._version_var,
+            font=("Segoe UI", 9),
+            fg=MUTED,
+            bg=BG,
+        ).pack(side="right")
+        self._update_var = tk.StringVar(value="")
+        tk.Label(
+            foot,
+            textvariable=self._update_var,
+            font=("Segoe UI", 9),
+            fg=WARN,
+            bg=BG,
+        ).pack(side="right", padx=(0, 12))
         tk.Label(
             foot,
             text=f"License support: {LICENSE_CONTACT_LABEL}",
@@ -461,6 +484,124 @@ class StudioLauncherApp:
             cursor="hand2",
         ).pack(side="left", padx=(8, 0))
         foot.winfo_children()[-1].bind("<Button-1>", lambda _e: self._open_license_contact())
+
+    def _refresh_version_label(self) -> None:
+        self._version_var.set(f"v{get_studio_release_version()}")
+
+    def _set_update_status(self, status: UpdateStatus) -> None:
+        self._update_status = status
+        if status.update_available:
+            self._update_var.set(f"Update available: v{status.latest}")
+        else:
+            self._update_var.set("")
+
+    def _check_updates_quiet(self) -> None:
+        def work() -> None:
+            try:
+                status = check_for_updates()
+            except Exception:
+                return
+
+            def notify() -> None:
+                self._set_update_status(status)
+                if not status.update_available:
+                    return
+                if messagebox.askyesno(
+                    "Update available",
+                    f"Version {status.latest} is available (you have {status.current}).\n\n"
+                    "Open the update options now?",
+                ):
+                    self._show_update_dialog(status)
+
+            self.root.after(0, notify)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _check_updates(self, *, manual: bool) -> None:
+        self._enqueue_log("Checking for updates…")
+
+        def work() -> None:
+            status = check_for_updates()
+
+            def done() -> None:
+                self._set_update_status(status)
+                if status.error:
+                    self._enqueue_log(f"Update check failed: {status.error}")
+                    if manual:
+                        messagebox.showwarning(
+                            "Update check failed",
+                            f"Could not reach GitHub.\n\n{status.error}",
+                        )
+                    return
+                if not status.update_available:
+                    self._enqueue_log(f"Up to date (v{status.current}).")
+                    if manual:
+                        messagebox.showinfo("Up to date", f"You have the latest version (v{status.current}).")
+                    return
+                self._enqueue_log(f"Update available: v{status.latest} (you have v{status.current}).")
+                self._show_update_dialog(status)
+
+            self.root.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_update_dialog(self, status: UpdateStatus) -> None:
+        if status.can_git_update:
+            choice = messagebox.askyesnocancel(
+                "Update available",
+                f"Version {status.latest} is available (you have {status.current}).\n\n"
+                "Yes = Update now (git pull)\n"
+                "No = Open download page (ZIP install)\n"
+                "Cancel = Later",
+            )
+            if choice is True:
+                self._run_git_update()
+            elif choice is False:
+                import webbrowser
+
+                webbrowser.open(status.zip_url)
+                messagebox.showinfo(
+                    "Download update",
+                    "Download the ZIP, extract it, and replace your app folder.\n\n"
+                    "Keep your data\\license.json file if you want to keep the same license.",
+                )
+            return
+
+        if messagebox.askyesno(
+            "Update available",
+            f"Version {status.latest} is available (you have {status.current}).\n\n"
+            "Open the download page?",
+        ):
+            import webbrowser
+
+            webbrowser.open(status.zip_url)
+            messagebox.showinfo(
+                "Download update",
+                "Download the ZIP, extract it, and replace your app folder.\n\n"
+                "Keep your data\\license.json file if you want to keep the same license.",
+            )
+
+    def _run_git_update(self) -> None:
+        self._enqueue_log("Applying update…")
+
+        def work() -> None:
+            ok, msg = apply_git_update(self._enqueue_log)
+
+            def done() -> None:
+                self._refresh_version_label()
+                if ok:
+                    messagebox.showinfo(
+                        "Updated",
+                        f"{msg}\n\nSetup will run if anything new is needed.",
+                    )
+                    self._check_updates(manual=False)
+                    self._run_setup()
+                else:
+                    messagebox.showerror("Update failed", msg)
+
+            self.root.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _build_license_panel(self) -> None:
         frame = tk.LabelFrame(

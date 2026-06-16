@@ -42,6 +42,14 @@ Contact [t.me/rornpisith](https://t.me/rornpisith) with your **Machine ID** to g
 
 Works from **git clone** or **Download ZIP** — no extra commands needed.
 
+## Updates
+
+- Launcher shows your version (bottom-right), e.g. `v2.0.1`.
+- **Check for updates** compares with GitHub.
+- On startup, you may get a prompt if a newer version exists.
+- **Git install:** choose **Update now** → `git pull` → setup runs automatically.
+- **ZIP install:** download the new ZIP, extract, replace the folder (keep `data\license.json` for your license).
+
 ## What you install manually
 
 - **NVIDIA GPU driver** — optional, for faster synthesis
