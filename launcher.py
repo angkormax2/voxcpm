@@ -256,9 +256,9 @@ def _license_tone(status: LicenseStatus) -> tuple[str, str]:
         return "negative", "Not activated"
     if status.expires == "dev":
         return "positive", "Active"
-    days = status.remaining_days if status.remaining_days is not None else 999
-    if days <= 0:
+    if status.remaining_label == "Expired":
         return "negative", "Expired"
+    days = status.remaining_days if status.remaining_days is not None else 999
     if days <= 7:
         return "warning", "Active"
     return "positive", "Active"

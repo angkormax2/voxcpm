@@ -217,9 +217,9 @@ class StudioLauncherApp:
             return ERR
         if status.expires == "dev":
             return OK
-        days = status.remaining_days if status.remaining_days is not None else 999
-        if days <= 0:
+        if status.remaining_label == "Expired":
             return ERR
+        days = status.remaining_days if status.remaining_days is not None else 999
         if days <= 7:
             return WARN
         return OK
