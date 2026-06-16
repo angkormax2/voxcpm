@@ -513,12 +513,43 @@ def _pip_env() -> dict[str, str]:
     }
 
 
-def _pip_bootstrap(pip: list[str], log: LogFn) -> None:
-    _run_live(
-        pip + ["install", "--upgrade", "pip", "setuptools", "wheel"],
-        log=log,
-        env=_pip_env(),
-        parse_progress=True,
+def _venv_pip_works() -> bool:
+    if not VENV_PYTHON.is_file():
+        return False
+    try:
+        subprocess.check_call(
+            [str(VENV_PYTHON), "-m", "pip", "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            **_subprocess_hide_kwargs(),
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _repair_venv_pip(log: LogFn) -> bool:
+    if _venv_pip_works():
+        return True
+    if not VENV_PYTHON.is_file():
+        return False
+    log("Repairing pip in .venv…")
+    if _run([str(VENV_PYTHON), "-m", "ensurepip", "--upgrade"], log=log) != 0:
+        return False
+    return _venv_pip_works()
+
+
+def _pip_bootstrap(pip: list[str], log: LogFn) -> bool:
+    if not _repair_venv_pip(log):
+        return False
+    return (
+        _run_live(
+            pip + ["install", "--upgrade", "pip", "setuptools", "wheel"],
+            log=log,
+            env=_pip_env(),
+            parse_progress=True,
+        )
+        == 0
     )
 
 
@@ -545,22 +576,34 @@ def _pip_install_project(pip: list[str], log: LogFn) -> bool:
 
 
 def _ensure_venv(py_exe: str, log: LogFn) -> bool:
+    venv_path = PROJECT_ROOT / ".venv"
     if VENV_PYTHON.is_file():
         venv_ver = _python_version_tuple(str(VENV_PYTHON))
-        if _python_supported(venv_ver):
+        if _python_supported(venv_ver) and _venv_pip_works():
+            return True
+        if _python_supported(venv_ver) and _repair_venv_pip(log):
             return True
         shown = f"{venv_ver[0]}.{venv_ver[1]}" if venv_ver else "unknown"
-        log(f"Removing old .venv (Python {shown} is not supported)…")
+        if _python_supported(venv_ver):
+            log("Removing broken .venv (pip missing)…")
+        else:
+            log(f"Removing old .venv (Python {shown} is not supported)…")
         log("PHASE|20|Recreating Python environment")
-        shutil.rmtree(PROJECT_ROOT / ".venv", ignore_errors=True)
+        shutil.rmtree(venv_path, ignore_errors=True)
 
     log("Creating virtual environment…")
-    venv_path = PROJECT_ROOT / ".venv"
-    if _which("uv"):
-        if _run(["uv", "venv", str(venv_path), "--python", py_exe], log=log) == 0:
+    venv_args = [py_exe, "-m", "venv", str(venv_path)]
+    py_ver = _python_version_tuple(py_exe)
+    if py_ver and py_ver >= (3, 12):
+        venv_args.append("--upgrade-deps")
+    if _which("uv") and not venv_path.is_dir():
+        if _run(["uv", "venv", str(venv_path), "--python", py_exe], log=log) == 0 and _repair_venv_pip(log):
             return VENV_PYTHON.is_file()
-    if _run([py_exe, "-m", "venv", str(venv_path)], log=log) != 0:
+    if _run(venv_args, log=log) != 0:
         log("Failed to create .venv")
+        return False
+    if not _repair_venv_pip(log):
+        log("Failed to bootstrap pip in .venv")
         return False
     return VENV_PYTHON.is_file()
 
@@ -899,13 +942,13 @@ def run_checks() -> list[CheckResult]:
         )
     )
 
-    venv_ok = VENV_PYTHON.is_file()
+    venv_ok = VENV_PYTHON.is_file() and _venv_pip_works()
     results.append(
         CheckResult(
             key="venv",
             label="Python venv",
             ok=venv_ok,
-            detail=str(VENV_PYTHON.parent.parent) if venv_ok else "Missing .venv",
+            detail=str(VENV_PYTHON.parent.parent) if VENV_PYTHON.is_file() else "Missing .venv",
             fix_hint="Click Run setup",
         )
     )
@@ -1027,7 +1070,6 @@ def bootstrap_setup(manager: StudioManager) -> bool:
             manager.log("Setup failed. Open setup log for details, then click Run setup again.")
             return False
     manager.log("PHASE|100|Setup check complete")
-    manager.log("Setup check complete.")
     return True
 
 
@@ -1123,13 +1165,20 @@ class StudioManager:
             self._setup_lock.release()
 
     def _setup_impl(self) -> bool:
+        if _studio_environment_ready():
+            self.log("=== Setup started ===")
+            self.log("Everything is already installed — nothing to do.")
+            self.log("PHASE|100|Already up to date")
+            self.log("=== Setup finished ===")
+            return True
+
         self.log("=== Setup started ===")
         self.log("PHASE|10|Checking prerequisites")
         if not ensure_prerequisites(self.log):
             return False
 
         self.log("PHASE|18|Preparing Python environment")
-        py_exe = _ensure_studio_python(self.log)
+        py_exe = _find_studio_python() or _ensure_studio_python(self.log)
         if not py_exe:
             return False
         if not _ensure_venv(py_exe, self.log):
@@ -1139,7 +1188,12 @@ class StudioManager:
         has_nvidia = next((c.ok for c in checks if c.key == "gpu"), False)
 
         pip = [str(VENV_PYTHON), "-m", "pip"]
-        _pip_bootstrap(pip, self.log)
+        if not _pip_bootstrap(pip, self.log):
+            self.log("Python environment repair failed — retrying with a fresh .venv…")
+            shutil.rmtree(PROJECT_ROOT / ".venv", ignore_errors=True)
+            if not _ensure_venv(py_exe, self.log) or not _pip_bootstrap(pip, self.log):
+                self.log("Python install failed.")
+                return False
 
         torch_ok = False
         try:

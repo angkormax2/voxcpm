@@ -24,7 +24,7 @@ def parse_log_message(msg: str) -> LogEvent:
     phase = _PHASE_RE.match(msg)
     if phase:
         return LogEvent(
-            phase.group(2).strip(),
+            "",
             level="info",
             progress=float(phase.group(1)),
             progress_text=phase.group(2).strip(),
