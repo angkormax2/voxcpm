@@ -66,6 +66,7 @@ class StudioLauncherApp:
         self._log_visible = False
         self._servers_up = False
         self._update_status: UpdateStatus | None = None
+        self._update_snoozed = False
 
         self._set_window_icon()
         self._build_main_ui()
@@ -496,6 +497,9 @@ class StudioLauncherApp:
             self._update_var.set("")
 
     def _check_updates_quiet(self) -> None:
+        if self._update_snoozed:
+            return
+
         def work() -> None:
             try:
                 status = check_for_updates()
@@ -565,6 +569,8 @@ class StudioLauncherApp:
                     "Download the ZIP, extract it, and replace your app folder.\n\n"
                     "Keep your data\\license.json file if you want to keep the same license.",
                 )
+            else:
+                self._update_snoozed = True
             return
 
         if messagebox.askyesno(
@@ -590,11 +596,20 @@ class StudioLauncherApp:
             def done() -> None:
                 self._refresh_version_label()
                 if ok:
+                    status = check_for_updates()
+                    self._set_update_status(status)
                     messagebox.showinfo(
                         "Updated",
                         f"{msg}\n\nSetup will run if anything new is needed.",
                     )
-                    self._check_updates(manual=False)
+                    if status.update_available:
+                        messagebox.showwarning(
+                            "Update incomplete",
+                            "Files were pulled but version did not change.\n\n"
+                            "Use Check for updates → No to download the ZIP.",
+                        )
+                    else:
+                        self._update_snoozed = True
                     self._run_setup()
                 else:
                     messagebox.showerror("Update failed", msg)

@@ -14,7 +14,7 @@ from typing import Callable
 from studio_branding import (
     DEFAULT_STUDIO_REPO_URL,
     PROJECT_ROOT,
-    STUDIO_RELEASE_VERSION,
+    get_studio_release_version,
     get_studio_repo_url,
 )
 
@@ -69,11 +69,28 @@ def _repo_page() -> str:
 
 
 def get_local_version() -> str:
-    return STUDIO_RELEASE_VERSION
+    """Always read from disk so git pull / ZIP replace is detected."""
+    return get_studio_release_version()
 
 
 def _git_available() -> bool:
-    return bool(shutil.which("git")) and (PROJECT_ROOT / ".git").is_dir()
+    if not shutil.which("git"):
+        return False
+    git_dir = PROJECT_ROOT / ".git"
+    if not git_dir.exists():
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=str(PROJECT_ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        return proc.returncode == 0 and proc.stdout.strip() == "true"
+    except Exception:
+        return False
 
 
 def fetch_latest_version(*, timeout: int = 20) -> str:
@@ -111,6 +128,19 @@ def check_for_updates() -> UpdateStatus:
     )
 
 
+def _git_run(args: list[str], log: LogFn | None = None) -> subprocess.CompletedProcess[str]:
+    if log:
+        log(f"$ git {' '.join(args)}")
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(PROJECT_ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
 def apply_git_update(log: LogFn | None = None) -> tuple[bool, str]:
     if not _git_available():
         return False, "This folder was not installed with git clone."
@@ -118,6 +148,12 @@ def apply_git_update(log: LogFn | None = None) -> tuple[bool, str]:
     def _log(msg: str) -> None:
         if log:
             log(msg)
+
+    before = get_local_version()
+    try:
+        remote_latest = fetch_latest_version()
+    except Exception as exc:
+        remote_latest = before
 
     _log("Stopping servers before update…")
     try:
@@ -127,24 +163,39 @@ def apply_git_update(log: LogFn | None = None) -> tuple[bool, str]:
     except Exception:
         pass
 
-    _log("Downloading update (git pull)…")
-    proc = subprocess.run(
-        ["git", "pull", "--ff-only"],
-        cwd=str(PROJECT_ROOT),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if proc.stdout.strip():
-        _log(proc.stdout.strip())
-    if proc.stderr.strip():
-        _log(proc.stderr.strip())
-    if proc.returncode != 0:
-        return False, proc.stderr.strip() or "git pull failed."
+    _log("Fetching latest files from GitHub…")
+    fetch = _git_run(["fetch", "origin", "main"], log)
+    if fetch.stdout.strip():
+        _log(fetch.stdout.strip())
+    if fetch.stderr.strip():
+        _log(fetch.stderr.strip())
 
-    from studio_branding import get_studio_release_version
+    _log("Applying update (git pull)…")
+    pull = _git_run(["pull", "--ff-only", "origin", "main"], log)
+    if pull.stdout.strip():
+        _log(pull.stdout.strip())
+    if pull.stderr.strip():
+        _log(pull.stderr.strip())
+    if pull.returncode != 0:
+        return False, pull.stderr.strip() or pull.stdout.strip() or "git pull failed."
 
-    new_ver = get_studio_release_version()
-    _log(f"Update complete. Now at version {new_ver}.")
-    return True, f"Update complete. Version {new_ver}."
+    after = get_local_version()
+    if version_newer(remote_latest, after):
+        return (
+            False,
+            "Git pull finished but this folder is still on an older version.\n\n"
+            "Use “No” on the update dialog to download the ZIP, or run:\n"
+            "  git fetch origin main\n"
+            "  git reset --hard origin/main\n"
+            "(Your license in data\\license.json is kept — it is not in git.)",
+        )
+
+    if before == after and version_newer(remote_latest, after):
+        return (
+            False,
+            "Already up to date according to git, but version file is still old.\n\n"
+            "Please download the ZIP from GitHub and replace the app folder.",
+        )
+
+    _log(f"Update complete. Now at version {after}.")
+    return True, f"Update complete. Version {after}."
