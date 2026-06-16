@@ -35,7 +35,7 @@ Contact [t.me/rornpisith](https://t.me/rornpisith) with your **Machine ID** to g
 | Step | First run |
 |------|-----------|
 | Python 3.10–3.12 | Finds `py -3.12` or installs via winget |
-| Node.js 18+ | winget if missing |
+| Node.js 18+ LTS | **Auto-installs via winget** if missing |
 | `.venv`, PyTorch, VoxCPM package | Yes |
 | VoxCPM2 weights | Yes (several GB) |
 | `npm install` (starter-kit) | Yes |

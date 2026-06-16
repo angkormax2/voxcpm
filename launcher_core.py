@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -27,6 +28,7 @@ WINGET_NODE_ID = "OpenJS.NodeJS.LTS"
 HF_VOXCPM2_REPO = "openbmb/VoxCPM2"
 STUDIO_PYTHON_MIN = (3, 10)
 STUDIO_PYTHON_MAX = (3, 12)
+STUDIO_NODE_MIN = (18, 0)
 STUDIO_PACKAGE_VERSION = "2.0.0"
 
 LogFn = Callable[[str], None]
@@ -112,14 +114,50 @@ def _which(name: str) -> str | None:
 
 def _find_node_exe() -> str | None:
     """Full path to node.exe (Windows-safe for hidden subprocesses)."""
-    for exe in (
+    _refresh_windows_path()
+    local = os.environ.get("LOCALAPPDATA", "")
+    program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+    program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    candidates = [
         _which("node"),
+        os.path.join(program_files, "nodejs", "node.exe"),
+        os.path.join(program_files_x86, "nodejs", "node.exe"),
         r"C:\Program Files\nodejs\node.exe",
-        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "nodejs", "node.exe"),
-    ):
-        if exe and Path(exe).is_file():
-            return str(Path(exe).resolve())
+        os.path.join(local, "Programs", "nodejs", "node.exe"),
+    ]
+    seen: set[str] = set()
+    for exe in candidates:
+        if not exe:
+            continue
+        path = str(Path(exe).resolve())
+        if path in seen or not Path(path).is_file():
+            continue
+        seen.add(path)
+        return path
     return None
+
+
+def _node_version_tuple(node_exe: str) -> tuple[int, int] | None:
+    try:
+        out = subprocess.check_output(
+            [node_exe, "-v"],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **_subprocess_hide_kwargs(),
+        ).strip()
+        match = re.match(r"v?(\d+)\.(\d+)", out)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+    except Exception:
+        pass
+    return None
+
+
+def _node_supported(ver: tuple[int, int] | None) -> bool:
+    if ver is None:
+        return False
+    return ver >= STUDIO_NODE_MIN
 
 
 def _npm_command(*args: str) -> list[str] | None:
@@ -337,14 +375,19 @@ def _refresh_windows_path() -> None:
     if sys.platform != "win32":
         return
     local = os.environ.get("LOCALAPPDATA", "")
+    program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+    program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
     candidates = [
         os.path.join(local, "Programs", "Python", "Python312"),
         os.path.join(local, "Programs", "Python", "Python312", "Scripts"),
         os.path.join(local, "Programs", "Python", "Python311"),
         os.path.join(local, "Programs", "Python", "Python311", "Scripts"),
+        os.path.join(program_files, "nodejs"),
+        os.path.join(program_files_x86, "nodejs"),
         r"C:\Program Files\nodejs",
-        r"C:\Program Files\Python312",
-        r"C:\Program Files\Python312\Scripts",
+        os.path.join(local, "Programs", "nodejs"),
+        os.path.join(program_files, "Python312"),
+        os.path.join(program_files, "Python312", "Scripts"),
     ]
     extras = [p for p in candidates if os.path.isdir(p)]
     if extras:
@@ -371,31 +414,82 @@ def _winget_install(package_id: str, log: LogFn) -> bool:
     return rc == 0
 
 
+def _winget_upgrade(package_id: str, log: LogFn) -> bool:
+    if not _winget_available():
+        return False
+    log(f"Upgrading {package_id} via winget…")
+    rc = _run(
+        [
+            "winget",
+            "upgrade",
+            "-e",
+            "--id",
+            package_id,
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+        ],
+        log=log,
+    )
+    _refresh_windows_path()
+    return rc == 0
+
+
+def _wait_for_node(log: LogFn, *, seconds: int = 30) -> str | None:
+    for _ in range(max(1, seconds // 2)):
+        _refresh_windows_path()
+        node = _find_node_exe()
+        if node and _npm_command("--version"):
+            ver = _node_version_tuple(node)
+            if _node_supported(ver):
+                if ver:
+                    log(f"Using Node.js {ver[0]}.{ver[1]} ({node})")
+                return node
+        time.sleep(2)
+    return None
+
+
+def _ensure_node_js(log: LogFn) -> bool:
+    """Ensure Node.js LTS + npm — auto-install via winget on Windows."""
+    node = _find_node_exe()
+    if node:
+        ver = _node_version_tuple(node)
+        if _node_supported(ver) and _npm_command("--version"):
+            log(f"Using Node.js {ver[0]}.{ver[1]} ({node})")
+            return True
+        if ver:
+            log(f"Node.js {ver[0]}.{ver[1]} is too old — installing LTS…")
+        else:
+            log("Node.js found but npm is missing — reinstalling LTS…")
+
+    if sys.platform != "win32":
+        log("Node.js LTS not found. Install from https://nodejs.org/")
+        return False
+
+    if not _winget_available():
+        log("Node.js LTS not found and winget is unavailable. Install from https://nodejs.org/")
+        return False
+
+    log("Installing Node.js LTS automatically (winget)…")
+    if not _winget_install(WINGET_NODE_ID, log):
+        log("Trying Node.js LTS upgrade via winget…")
+        _winget_upgrade(WINGET_NODE_ID, log)
+
+    node = _wait_for_node(log)
+    if node:
+        return True
+
+    log(
+        "Node.js LTS was installed but is not visible yet.\n"
+        "Close and reopen VoxCPM Studio.bat, then click Run setup again."
+    )
+    return False
+
+
 def ensure_prerequisites(log: LogFn) -> bool:
     """Ensure supported Python and Node.js exist; on Windows try winget if missing."""
     if not _ensure_studio_python(log):
         return False
-
-    if not _find_node_exe():
-        if sys.platform != "win32":
-            log("Node.js not found. Install from https://nodejs.org/")
-            return False
-        if not _winget_available():
-            log("Node.js not found. Install from https://nodejs.org/")
-            return False
-        if not _winget_install(WINGET_NODE_ID, log):
-            log("Node.js install failed. Install from https://nodejs.org/")
-            return False
-        _refresh_windows_path()
-        if not _find_node_exe():
-            log("Node.js installed but not on PATH. Restart the launcher or log in again.")
-            return False
-
-    if not _npm_command("--version"):
-        log("npm not found next to Node.js. Reinstall Node.js LTS from https://nodejs.org/")
-        return False
-
-    return True
+    return _ensure_node_js(log)
 
 
 def _run_live(
@@ -515,24 +609,21 @@ def run_checks() -> list[CheckResult]:
 
     node = _find_node_exe()
     node_ver = ""
+    node_ok = False
     if node:
-        try:
-            node_ver = subprocess.check_output(
-                [node, "-v"],
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                **hide,
-            ).strip()
-        except Exception:
+        ver = _node_version_tuple(node)
+        if ver:
+            node_ver = f"Node.js {ver[0]}.{ver[1]}"
+            node_ok = _node_supported(ver) and bool(_npm_command("--version"))
+        else:
             node_ver = "found"
     results.append(
         CheckResult(
             key="nodejs",
-            label="Node.js",
-            ok=bool(node),
+            label="Node.js LTS",
+            ok=node_ok,
             detail=node_ver or "Not found",
-            fix_hint="Install Node.js 18+ from nodejs.org",
+            fix_hint="Setup installs Node.js LTS automatically on Windows",
         )
     )
 
@@ -821,7 +912,12 @@ class StudioManager:
 
         npm_cmd = _npm_command("install", "--no-audit", "--no-fund", "--loglevel=error")
         if not npm_cmd:
-            self.log("Node.js/npm missing — install Node.js LTS, then run Setup again.")
+            self.log("npm missing — installing Node.js LTS, then retrying…")
+            if not _ensure_node_js(self.log):
+                return False
+            npm_cmd = _npm_command("install", "--no-audit", "--no-fund", "--loglevel=error")
+        if not npm_cmd:
+            self.log("npm install failed — close launcher, reopen, and run Setup again.")
             return False
 
         self.log("Installing frontend packages (npm)…")
