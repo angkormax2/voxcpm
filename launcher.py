@@ -62,6 +62,7 @@ class StudioLauncherApp:
         self._checks_busy = False
         self._log_line_count = 0
         self._activity_busy = False
+        self._last_progress_log_pct = -1
         self._window_icon: tk.PhotoImage | None = None
         self._header_logo: tk.PhotoImage | None = None
         self._setup_started = False
@@ -120,7 +121,7 @@ class StudioLauncherApp:
         self._log_pct_var.set("100%" if success else "")
         self._activity_var.set("Ready" if success else "Setup needs attention")
 
-    def _set_log_progress(self, pct: float, text: str = "") -> None:
+    def _set_log_progress(self, pct: float, text: str = "", detail: str = "") -> None:
         if self._activity_busy:
             self._log_progress.stop()
             self._log_progress.configure(mode="determinate")
@@ -128,12 +129,25 @@ class StudioLauncherApp:
         pct = max(0.0, min(100.0, pct))
         self._log_progress["value"] = pct
         self._log_pct_var.set(f"{int(pct)}%")
-        if text:
-            self._activity_var.set(text)
+        shown = detail or text
+        if shown:
+            self._log_detail_var.set(shown)
+            self._activity_var.set(shown if len(shown) <= 72 else shown[:69] + "…")
+            step = int(pct // 10) * 10
+            if step > self._last_progress_log_pct or pct >= 100:
+                self._last_progress_log_pct = step
+                self.log_box.configure(state="normal")
+                self.log_box.insert(tk.END, shown + "\n", ("dim",))
+                self.log_box.see(tk.END)
+                self.log_box.configure(state="disabled")
 
     def _apply_log_event(self, event: LogEvent) -> None:
         if event.progress is not None:
-            self._set_log_progress(event.progress, event.progress_text or event.text)
+            self._set_log_progress(
+                event.progress,
+                event.progress_text or event.text,
+                event.progress_detail,
+            )
         elif event.level == "title":
             lower = event.text.lower()
             if "started" in lower:
@@ -453,7 +467,8 @@ class StudioLauncherApp:
         ttk.Button(btn_row, text="Refresh checks", command=self.refresh_checks_async).pack(
             side="left", padx=(0, 8)
         )
-        ttk.Button(btn_row, text="Run setup", command=self._run_setup).pack(side="left", padx=(0, 8))
+        self.setup_btn = ttk.Button(btn_row, text="Run setup", command=self._run_setup)
+        self.setup_btn.pack(side="left", padx=(0, 8))
         ttk.Button(btn_row, text="Enter license", command=lambda: self._show_license_dialog()).pack(
             side="left", padx=(0, 8)
         )
@@ -551,6 +566,16 @@ class StudioLauncherApp:
             bg=PANEL,
             width=5,
         ).pack(side="right", padx=(8, 0))
+
+        self._log_detail_var = tk.StringVar(value="")
+        tk.Label(
+            self.log_frame,
+            textvariable=self._log_detail_var,
+            font=("Consolas", 9),
+            fg=MUTED,
+            bg=PANEL,
+            anchor="w",
+        ).pack(fill="x", padx=10, pady=(0, 4))
 
         log_toolbar = tk.Frame(self.log_frame, bg=PANEL)
         log_toolbar.pack(fill="x", padx=10, pady=(0, 4))
@@ -880,9 +905,17 @@ class StudioLauncherApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _set_setup_busy(self, busy: bool) -> None:
+        try:
+            self.setup_btn.configure(state="disabled" if busy else "normal")
+        except Exception:
+            pass
+
     def _run_setup(self) -> None:
         self.root.after(0, self._show_log_panel_if_hidden)
         self.root.after(0, lambda: self._begin_activity("Running setup…"))
+        self.root.after(0, lambda: self._set_setup_busy(True))
+        self._last_progress_log_pct = -1
         self._enqueue_log("Running setup…")
 
         def work() -> None:
@@ -894,6 +927,7 @@ class StudioLauncherApp:
                 self._enqueue_log(f"Error: {exc}")
                 self.root.after(0, lambda: self._finish_activity(success=False))
             finally:
+                self.root.after(0, lambda: self._set_setup_busy(False))
                 self.root.after(0, self.refresh_checks_async)
 
         threading.Thread(target=work, daemon=True).start()

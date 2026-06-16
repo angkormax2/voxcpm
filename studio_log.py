@@ -12,6 +12,7 @@ class LogEvent:
     level: str = "info"
     progress: float | None = None
     progress_text: str = ""
+    progress_detail: str = ""
 
 
 _PROGRESS_RE = re.compile(r"^PROGRESS\|(\d+(?:\.\d+)?)\|(.*)$")
@@ -30,8 +31,14 @@ def parse_log_message(msg: str) -> LogEvent:
         )
     prog = _PROGRESS_RE.match(msg)
     if prog:
-        label = prog.group(2).strip() or "Downloading…"
-        return LogEvent("", level="info", progress=float(prog.group(1)), progress_text=label)
+        detail = prog.group(2).strip()
+        return LogEvent(
+            "",
+            level="info",
+            progress=float(prog.group(1)),
+            progress_detail=detail,
+            progress_text=detail,
+        )
 
     lower = msg.lower()
     if msg.startswith("=== ") and msg.endswith(" ==="):

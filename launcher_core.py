@@ -26,6 +26,7 @@ TORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu126"
 TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
 WINGET_PYTHON_ID = "Python.Python.3.12"
 WINGET_NODE_ID = "OpenJS.NodeJS.LTS"
+WINGET_UNSUPPORTED_PYTHON_IDS = tuple(f"Python.Python.3.{minor}" for minor in range(13, 20))
 HF_VOXCPM2_REPO = "openbmb/VoxCPM2"
 STUDIO_PYTHON_MIN = (3, 10)
 STUDIO_PYTHON_MAX = (3, 12)
@@ -299,9 +300,13 @@ def _iter_python_candidates() -> list[str]:
         ):
             add(rel)
 
-    add(_which("python"))
+    py_default = _which("python")
+    if py_default and _python_supported(_python_version_tuple(py_default)):
+        add(py_default)
     if sys.executable:
-        add(sys.executable)
+        exe = str(Path(sys.executable).resolve())
+        if _python_supported(_python_version_tuple(exe)):
+            add(exe)
     return candidates
 
 
@@ -324,23 +329,114 @@ def _ensure_studio_python(log: LogFn) -> str | None:
     if ver and not _python_supported(ver):
         log(
             f"Python {ver[0]}.{ver[1]} is not supported for Studio "
-            f"(use {STUDIO_PYTHON_MIN[0]}.{STUDIO_PYTHON_MIN[1]}–"
+            f"(need {STUDIO_PYTHON_MIN[0]}.{STUDIO_PYTHON_MIN[1]}–"
             f"{STUDIO_PYTHON_MAX[0]}.{STUDIO_PYTHON_MAX[1]})."
         )
+    elif ver is None:
+        log("Supported Python (3.10–3.12) was not found on this PC.")
 
-    if sys.platform == "win32" and _winget_available():
-        log("Installing Python 3.12 via winget…")
-        if _winget_install(WINGET_PYTHON_ID, log):
-            _refresh_windows_path()
-            py = _find_studio_python()
+    if sys.platform == "win32":
+        log("Studio will install Python 3.12 automatically — please wait…")
+        log("PHASE|12|Installing Python 3.12")
+        if _install_studio_python_windows(log):
+            py = _wait_for_studio_python(log)
             if py:
-                log(f"Using {_python_label(py)}")
+                _remove_unsupported_winget_python(log)
                 return py
+        log(
+            "Automatic Python install did not finish. "
+            "Close Studio, reopen VoxCPM Studio.bat, then click Run setup again."
+        )
+        return None
 
     log(
         f"Install Python {STUDIO_PYTHON_MIN[0]}.{STUDIO_PYTHON_MIN[1]}–"
         f"{STUDIO_PYTHON_MAX[0]}.{STUDIO_PYTHON_MAX[1]} from https://www.python.org/downloads/"
     )
+    return None
+
+
+def _winget_list_has(package_id: str) -> bool:
+    if not _winget_available():
+        return False
+    try:
+        proc = subprocess.run(
+            ["winget", "list", "-e", "--id", package_id],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **_subprocess_hide_kwargs(),
+        )
+        if proc.returncode != 0:
+            return False
+        return package_id.lower() in proc.stdout.lower()
+    except Exception:
+        return False
+
+
+def _winget_uninstall(package_id: str, log: LogFn) -> bool:
+    if not _winget_available():
+        return False
+    log(f"Removing {package_id} via winget…")
+    rc = _run(
+        [
+            "winget",
+            "uninstall",
+            "-e",
+            "--id",
+            package_id,
+            "--accept-source-agreements",
+            "--disable-interactivity",
+        ],
+        log=log,
+    )
+    _refresh_windows_path()
+    return rc == 0
+
+
+def _remove_unsupported_winget_python(log: LogFn) -> None:
+    """Remove winget-managed Python 3.13+ so `python` does not point at unsupported builds."""
+    if sys.platform != "win32":
+        return
+    for package_id in WINGET_UNSUPPORTED_PYTHON_IDS:
+        if not _winget_list_has(package_id):
+            continue
+        ver = package_id.rsplit(".", 1)[-1]
+        log(f"Removing unsupported Python 3.{ver} (Studio uses Python 3.12)…")
+        _winget_uninstall(package_id, log)
+    _refresh_windows_path()
+
+
+def _install_studio_python_windows(log: LogFn) -> bool:
+    if not _winget_available():
+        log("winget is not available — cannot auto-install Python 3.12.")
+        return False
+
+    log("Installing Python 3.12 via winget (may prompt for admin approval)…")
+    if _winget_install(WINGET_PYTHON_ID, log):
+        return True
+
+    if _winget_list_has(WINGET_PYTHON_ID):
+        log("Python 3.12 is already installed via winget — refreshing PATH…")
+        _refresh_windows_path()
+        return True
+
+    log("Retrying Python 3.12 install via winget upgrade…")
+    if _winget_upgrade(WINGET_PYTHON_ID, log):
+        return True
+
+    return _winget_list_has(WINGET_PYTHON_ID)
+
+
+def _wait_for_studio_python(log: LogFn, *, seconds: int = 90) -> str | None:
+    for _ in range(max(1, seconds // 2)):
+        _refresh_windows_path()
+        py = _find_studio_python()
+        if py:
+            log(f"Python ready: {_python_label(py)}")
+            return py
+        time.sleep(2)
     return None
 
 
@@ -442,6 +538,7 @@ def _winget_install(package_id: str, log: LogFn) -> bool:
             package_id,
             "--accept-package-agreements",
             "--accept-source-agreements",
+            "--disable-interactivity",
         ],
         log=log,
     )
@@ -462,6 +559,7 @@ def _winget_upgrade(package_id: str, log: LogFn) -> bool:
             package_id,
             "--accept-package-agreements",
             "--accept-source-agreements",
+            "--disable-interactivity",
         ],
         log=log,
     )
@@ -580,13 +678,26 @@ def download_voxcpm2_weights(log: LogFn) -> bool:
     script = (
         "from huggingface_hub import snapshot_download\n"
         "from tqdm.auto import tqdm\n\n"
+        "def _fmt_bytes(n):\n"
+        "    n = float(n)\n"
+        "    if n >= 1024 ** 3:\n"
+        "        return f'{n / 1024 ** 3:.1f}GB'\n"
+        "    if n >= 1024 ** 2:\n"
+        "        return f'{n / 1024 ** 2:.1f}MB'\n"
+        "    if n >= 1024:\n"
+        "        return f'{n / 1024:.1f}KB'\n"
+        "    return f'{int(n)}B'\n\n"
         "class ProgressTqdm(tqdm):\n"
         "    def update(self, n=1):\n"
         "        super().update(n)\n"
         "        if self.total:\n"
         "            pct = min(100, int(100 * self.n / self.total))\n"
+        "            width = 20\n"
+        "            filled = int(width * self.n / self.total)\n"
+        "            bar = '#' * filled + '-' * (width - filled)\n"
         "            label = self.desc or 'Downloading model files'\n"
-        "            print(f'PROGRESS|{pct}|{label}', flush=True)\n\n"
+        "            detail = f'{bar} {_fmt_bytes(self.n)}/{_fmt_bytes(self.total)} | {label}'\n"
+        "            print(f'PROGRESS|{pct}|{detail}', flush=True)\n\n"
         f"dest = r'{dest}'\n"
         f"snapshot_download(repo_id='{HF_VOXCPM2_REPO}', local_dir=dest, tqdm_class=ProgressTqdm)\n"
         "print('Download complete:', dest)\n"
