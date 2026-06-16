@@ -8,6 +8,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,9 +95,9 @@ def _run(
             env=run_env,
             **_subprocess_hide_kwargs(),
         )
-    except FileNotFoundError:
+    except OSError as exc:
         if log:
-            log(f"Command not found: {cmd[0]}")
+            log(f"Failed to run command: {exc}")
         return 127
     if log:
         if proc.stdout.strip():
@@ -160,6 +161,25 @@ def _node_supported(ver: tuple[int, int] | None) -> bool:
     return ver >= STUDIO_NODE_MIN
 
 
+def _npm_env() -> dict[str, str]:
+    """PATH for npm child processes (postinstall scripts spawn npm again on Windows)."""
+    env = os.environ.copy()
+    node = _find_node_exe()
+    if not node:
+        return env
+    node_dir = str(Path(node).parent)
+    prepend: list[str] = [node_dir]
+    npm_bin = Path(node_dir) / "node_modules" / "npm" / "bin"
+    if npm_bin.is_dir():
+        prepend.append(str(npm_bin))
+    starter_bin = STARTER_KIT / "node_modules" / ".bin"
+    if starter_bin.is_dir():
+        prepend.append(str(starter_bin))
+    path = env.get("PATH", "")
+    env["PATH"] = os.pathsep.join(prepend) + (os.pathsep + path if path else "")
+    return env
+
+
 def _npm_command(*args: str) -> list[str] | None:
     """Build npm argv that works with CREATE_NO_WINDOW on Windows."""
     node = _find_node_exe()
@@ -175,12 +195,27 @@ def _npm_command(*args: str) -> list[str] | None:
             if sys.platform == "win32" and name.endswith(".cmd"):
                 return ["cmd.exe", "/d", "/c", str(script), *args]
             return [str(script), *args]
+    if sys.platform == "win32":
+        npm = _which("npm")
+        if npm and (npm.lower().endswith(".cmd") or Path(npm).suffix.lower() == ".cmd"):
+            return ["cmd.exe", "/d", "/c", npm, *args]
+        npm_cmd = node_dir / "npm.cmd"
+        if npm_cmd.is_file():
+            return ["cmd.exe", "/d", "/c", str(npm_cmd), *args]
+        return None
     npm = _which("npm")
     if npm:
-        if sys.platform == "win32" and npm.lower().endswith(".cmd"):
-            return ["cmd.exe", "/d", "/c", npm, *args]
         return [npm, *args]
     return None
+
+
+def _run_npm(*args: str, cwd: Path | None = None, log: LogFn | None = None) -> int:
+    cmd = _npm_command(*args)
+    if not cmd:
+        if log:
+            log("npm not found — install Node.js LTS and run Setup again.")
+        return 127
+    return _run_live(cmd, cwd=cwd or STARTER_KIT, log=log, env=_npm_env())
 
 
 def _node_exe() -> str | None:
@@ -497,19 +532,29 @@ def _run_live(
     *,
     cwd: Path | None = None,
     log: LogFn | None = None,
+    env: dict[str, str] | None = None,
 ) -> int:
     if log:
         log(f"$ {' '.join(cmd)}")
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(cwd or PROJECT_ROOT),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        **_subprocess_hide_kwargs(),
-    )
+    run_env = os.environ.copy()
+    if env:
+        run_env.update(env)
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(cwd or PROJECT_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=run_env,
+            **_subprocess_hide_kwargs(),
+        )
+    except OSError as exc:
+        if log:
+            log(f"Failed to run command: {exc}")
+        return 127
     assert proc.stdout is not None
     for line in proc.stdout:
         if log:
@@ -815,6 +860,7 @@ class StudioManager:
         self._log = log or (lambda _m: None)
         self._api_proc: subprocess.Popen | None = None
         self._ui_proc: subprocess.Popen | None = None
+        self._setup_lock = threading.Lock()
 
     @property
     def running(self) -> bool:
@@ -878,6 +924,15 @@ class StudioManager:
         self.log("Servers stopped.")
 
     def setup(self) -> bool:
+        if not self._setup_lock.acquire(blocking=False):
+            self.log("Setup already in progress — please wait.")
+            return False
+        try:
+            return self._setup_impl()
+        finally:
+            self._setup_lock.release()
+
+    def _setup_impl(self) -> bool:
         self.log("=== Setup started ===")
         self.log("PHASE|10|Checking prerequisites")
         if not ensure_prerequisites(self.log):
@@ -927,18 +982,10 @@ class StudioManager:
             return False
 
         self.log("PHASE|78|Installing frontend packages")
-        npm_cmd = _npm_command("install", "--no-audit", "--no-fund", "--loglevel=error")
-        if not npm_cmd:
-            self.log("npm missing — installing Node.js LTS, then retrying…")
-            if not _ensure_node_js(self.log):
-                return False
-            npm_cmd = _npm_command("install", "--no-audit", "--no-fund", "--loglevel=error")
-        if not npm_cmd:
-            self.log("npm install failed — close launcher, reopen, and run Setup again.")
+        if not _ensure_node_js(self.log):
             return False
-
         self.log("Installing frontend packages (npm)…")
-        if _run(npm_cmd, cwd=STARTER_KIT, log=self.log) != 0:
+        if _run_npm("install", "--no-audit", "--no-fund", "--loglevel=error", log=self.log) != 0:
             self.log("npm install failed.")
             return False
 
