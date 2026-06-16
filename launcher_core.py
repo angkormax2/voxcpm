@@ -27,6 +27,17 @@ TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
 WINGET_PYTHON_ID = "Python.Python.3.12"
 WINGET_NODE_ID = "OpenJS.NodeJS.LTS"
 WINGET_UNSUPPORTED_PYTHON_IDS = tuple(f"Python.Python.3.{minor}" for minor in range(13, 20))
+WINGET_LEGACY_NODE_IDS = tuple(f"OpenJS.NodeJS.{minor}" for minor in range(10, 18))
+
+_DL_BAR_RE = re.compile(
+    r"[#=\-\.█▇▆▅▄▃▂▁]+\s+([\d.]+)\s*/\s*([\d.]+)\s*(MB|KB|GB|B)",
+    re.I,
+)
+_WINGET_DL_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(KB|MB|GB)\s*/\s*(\d+(?:\.\d+)?)\s*(KB|MB|GB)",
+    re.I,
+)
+_PCT_RE = re.compile(r"(\d{1,3})%")
 HF_VOXCPM2_REPO = "openbmb/VoxCPM2"
 STUDIO_PYTHON_MIN = (3, 10)
 STUDIO_PYTHON_MAX = (3, 12)
@@ -115,7 +126,7 @@ def _which(name: str) -> str | None:
 
 
 def _find_node_exe() -> str | None:
-    """Full path to node.exe (Windows-safe for hidden subprocesses)."""
+    """Full path to node.exe — prefer newest supported version (Windows-safe)."""
     _refresh_windows_path()
     local = os.environ.get("LOCALAPPDATA", "")
     program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
@@ -128,6 +139,8 @@ def _find_node_exe() -> str | None:
         os.path.join(local, "Programs", "nodejs", "node.exe"),
     ]
     seen: set[str] = set()
+    best: str | None = None
+    best_ver: tuple[int, int] | None = None
     for exe in candidates:
         if not exe:
             continue
@@ -135,7 +148,42 @@ def _find_node_exe() -> str | None:
         if path in seen or not Path(path).is_file():
             continue
         seen.add(path)
-        return path
+        ver = _node_version_tuple(path)
+        if not _node_supported(ver):
+            continue
+        if best is None or (ver and best_ver and ver > best_ver):
+            best = path
+            best_ver = ver
+    return best
+
+
+def _progress_bar(pct: float, width: int = 20) -> str:
+    pct = max(0.0, min(100.0, pct))
+    filled = int(width * pct / 100)
+    return "#" * filled + "-" * (width - filled)
+
+
+def _try_parse_download_progress(line: str) -> tuple[int, str] | None:
+    line = line.strip()
+    if not line:
+        return None
+
+    m = _DL_BAR_RE.search(line) or _WINGET_DL_RE.search(line)
+    if m:
+        done_s, total_s, unit = m.group(1), m.group(2), m.group(3).upper()
+        done, total = float(done_s), float(total_s)
+        if total > 0:
+            pct = min(99, int(100 * done / total))
+            bar = _progress_bar(pct)
+            return pct, f"{bar} {done_s}/{total_s} {unit} | {line[:48]}"
+
+    if any(x in line.lower() for x in ("download", "mb", "kb", "gb", "extract", "installing", "reify")):
+        m = _PCT_RE.search(line)
+        if m:
+            pct = min(99, int(m.group(1)))
+            bar = _progress_bar(pct)
+            short = line if len(line) <= 64 else line[:61] + "…"
+            return pct, f"{bar} {short}"
     return None
 
 
@@ -216,7 +264,13 @@ def _run_npm(*args: str, cwd: Path | None = None, log: LogFn | None = None) -> i
         if log:
             log("npm not found — install Node.js LTS and run Setup again.")
         return 127
-    return _run_live(cmd, cwd=cwd or STARTER_KIT, log=log, env=_npm_env())
+    return _run_live(
+        cmd,
+        cwd=cwd or STARTER_KIT,
+        log=log,
+        env=_npm_env(),
+        parse_progress=True,
+    )
 
 
 def _node_exe() -> str | None:
@@ -395,6 +449,18 @@ def _winget_uninstall(package_id: str, log: LogFn) -> bool:
     return rc == 0
 
 
+def _remove_legacy_winget_node(log: LogFn) -> None:
+    """Remove outdated winget Node.js builds after LTS is available."""
+    if sys.platform != "win32" or not _winget_list_has(WINGET_NODE_ID):
+        return
+    for package_id in WINGET_LEGACY_NODE_IDS:
+        if not _winget_list_has(package_id):
+            continue
+        log(f"Removing outdated {package_id} (Studio uses Node.js LTS)…")
+        _winget_uninstall(package_id, log)
+    _refresh_windows_path()
+
+
 def _remove_unsupported_winget_python(log: LogFn) -> None:
     """Remove winget-managed Python 3.13+ so `python` does not point at unsupported builds."""
     if sys.platform != "win32":
@@ -448,10 +514,11 @@ def _pip_env() -> dict[str, str]:
 
 
 def _pip_bootstrap(pip: list[str], log: LogFn) -> None:
-    _run(
+    _run_live(
         pip + ["install", "--upgrade", "pip", "setuptools", "wheel"],
         log=log,
         env=_pip_env(),
+        parse_progress=True,
     )
 
 
@@ -464,7 +531,7 @@ def _pip_install_project(pip: list[str], log: LogFn) -> bool:
     for cmd in attempts:
         label = "editable" if "-e" in cmd else "standard"
         log(f"Installing VoxCPM package ({label})…")
-        if _run(cmd, log=log, env=env) != 0:
+        if _run_live(cmd, log=log, env=env, parse_progress=True) != 0:
             continue
         if (
             _run(
@@ -483,7 +550,8 @@ def _ensure_venv(py_exe: str, log: LogFn) -> bool:
         if _python_supported(venv_ver):
             return True
         shown = f"{venv_ver[0]}.{venv_ver[1]}" if venv_ver else "unknown"
-        log(f"Recreating .venv (found Python {shown}, need 3.10–3.12)…")
+        log(f"Removing old .venv (Python {shown} is not supported)…")
+        log("PHASE|20|Recreating Python environment")
         shutil.rmtree(PROJECT_ROOT / ".venv", ignore_errors=True)
 
     log("Creating virtual environment…")
@@ -529,7 +597,7 @@ def _winget_install(package_id: str, log: LogFn) -> bool:
     if not _winget_available():
         return False
     log(f"Installing {package_id} via winget (may prompt for admin)…")
-    rc = _run(
+    rc = _run_live(
         [
             "winget",
             "install",
@@ -541,6 +609,7 @@ def _winget_install(package_id: str, log: LogFn) -> bool:
             "--disable-interactivity",
         ],
         log=log,
+        parse_progress=True,
     )
     _refresh_windows_path()
     return rc == 0
@@ -550,7 +619,7 @@ def _winget_upgrade(package_id: str, log: LogFn) -> bool:
     if not _winget_available():
         return False
     log(f"Upgrading {package_id} via winget…")
-    rc = _run(
+    rc = _run_live(
         [
             "winget",
             "upgrade",
@@ -562,6 +631,7 @@ def _winget_upgrade(package_id: str, log: LogFn) -> bool:
             "--disable-interactivity",
         ],
         log=log,
+        parse_progress=True,
     )
     _refresh_windows_path()
     return rc == 0
@@ -588,9 +658,10 @@ def _ensure_node_js(log: LogFn) -> bool:
         ver = _node_version_tuple(node)
         if _node_supported(ver) and _npm_command("--version"):
             log(f"Using Node.js {ver[0]}.{ver[1]} ({node})")
+            _remove_legacy_winget_node(log)
             return True
         if ver:
-            log(f"Node.js {ver[0]}.{ver[1]} is too old — installing LTS…")
+            log(f"Node.js {ver[0]}.{ver[1]} is not suitable — installing LTS…")
         else:
             log("Node.js found but npm is missing — reinstalling LTS…")
 
@@ -602,13 +673,15 @@ def _ensure_node_js(log: LogFn) -> bool:
         log("Node.js LTS not found and winget is unavailable. Install from https://nodejs.org/")
         return False
 
+    log("PHASE|15|Installing Node.js LTS")
     log("Installing Node.js LTS automatically (winget)…")
     if not _winget_install(WINGET_NODE_ID, log):
         log("Trying Node.js LTS upgrade via winget…")
         _winget_upgrade(WINGET_NODE_ID, log)
 
-    node = _wait_for_node(log)
+    node = _wait_for_node(log, seconds=60)
     if node:
+        _remove_legacy_winget_node(log)
         return True
 
     log(
@@ -631,6 +704,7 @@ def _run_live(
     cwd: Path | None = None,
     log: LogFn | None = None,
     env: dict[str, str] | None = None,
+    parse_progress: bool = False,
 ) -> int:
     if log:
         log(f"$ {' '.join(cmd)}")
@@ -655,8 +729,13 @@ def _run_live(
         return 127
     assert proc.stdout is not None
     for line in proc.stdout:
-        if log:
-            log(line.rstrip())
+        s = line.rstrip()
+        if parse_progress and log:
+            parsed = _try_parse_download_progress(s)
+            if parsed:
+                log(f"PROGRESS|{parsed[0]}|{parsed[1]}")
+        if log and s:
+            log(s)
     return proc.wait()
 
 
@@ -1078,10 +1157,11 @@ class StudioManager:
             index = TORCH_CUDA_INDEX if has_nvidia else TORCH_CPU_INDEX
             self.log("PHASE|32|Installing PyTorch")
             self.log(f"Installing PyTorch ({'CUDA' if has_nvidia else 'CPU'})…")
-            _run(
+            _run_live(
                 pip + ["install", "torch", "torchaudio", "--index-url", index],
                 log=self.log,
                 env=_pip_env(),
+                parse_progress=True,
             )
 
         self.log("PHASE|45|Installing Python packages")
@@ -1096,9 +1176,15 @@ class StudioManager:
         if not _ensure_node_js(self.log):
             return False
         self.log("Installing frontend packages (npm)…")
-        if _run_npm("install", "--no-audit", "--no-fund", "--loglevel=error", log=self.log) != 0:
-            self.log("npm install failed.")
-            return False
+        npm_args = ("install", "--no-audit", "--no-fund", "--loglevel=warn")
+        if _run_npm(*npm_args, log=self.log) != 0:
+            node_modules = STARTER_KIT / "node_modules"
+            if node_modules.is_dir():
+                self.log("Cleaning broken frontend install and retrying npm…")
+                shutil.rmtree(node_modules, ignore_errors=True)
+            if _run_npm(*npm_args, log=self.log) != 0:
+                self.log("npm install failed.")
+                return False
 
         self.log("PHASE|100|Setup finished")
         self.log("=== Setup finished ===")
