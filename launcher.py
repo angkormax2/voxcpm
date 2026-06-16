@@ -1,4 +1,4 @@
-"""VoxCPM2 Studio — NiceGUI launcher (native window, smooth dark UI)."""
+"""VoxCPM2 Studio — NiceGUI premium launcher."""
 
 from __future__ import annotations
 
@@ -40,6 +40,103 @@ ICON_PNG = ASSETS / "studio_icon.png"
 LAUNCHER_PORT = 8765
 MAX_LOG_LINES = 400
 
+STUDIO_CSS = """
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+  body, .nicegui-content {
+    background: radial-gradient(1200px 600px at 10% -10%, #1a2744 0%, transparent 55%),
+                radial-gradient(900px 500px at 100% 0%, #2a1848 0%, transparent 50%),
+                #080a0f !important;
+    font-family: 'Inter', 'Segoe UI', sans-serif !important;
+  }
+  .studio-shell { max-width: 1040px; margin: 0 auto; padding: 20px 20px 28px; }
+  .studio-hero {
+    background: linear-gradient(135deg, rgba(79,140,255,0.18), rgba(124,92,255,0.12));
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 18px;
+    padding: 18px 22px;
+    margin-bottom: 16px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.35);
+  }
+  .studio-card {
+    background: rgba(18, 20, 28, 0.92) !important;
+    border: 1px solid rgba(255,255,255,0.07) !important;
+    border-radius: 16px !important;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.28);
+    backdrop-filter: blur(8px);
+  }
+  .studio-section-title {
+    font-size: 0.72rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #8b949e;
+    font-weight: 600;
+    margin-bottom: 10px;
+  }
+  .studio-subtitle { color: #9aa4b2; font-size: 0.9rem; }
+  .studio-version {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 999px;
+    padding: 4px 12px;
+    font-size: 0.75rem;
+    color: #c9d1d9;
+  }
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 14px;
+    border-radius: 999px;
+    font-weight: 600;
+    font-size: 0.9rem;
+  }
+  .status-pill.running {
+    background: rgba(63,185,80,0.15);
+    color: #3fb950;
+    border: 1px solid rgba(63,185,80,0.35);
+  }
+  .status-pill.stopped {
+    background: rgba(139,148,158,0.12);
+    color: #8b949e;
+    border: 1px solid rgba(255,255,255,0.08);
+  }
+  .status-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: currentColor;
+    box-shadow: 0 0 10px currentColor;
+  }
+  .check-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 10px;
+    width: 100%;
+  }
+  .check-tile {
+    border-radius: 12px;
+    padding: 12px 14px;
+    border: 1px solid rgba(255,255,255,0.06);
+    background: rgba(255,255,255,0.02);
+    min-height: 72px;
+  }
+  .check-tile.ok { border-color: rgba(63,185,80,0.25); background: rgba(63,185,80,0.06); }
+  .check-tile.warn { border-color: rgba(210,153,34,0.25); background: rgba(210,153,34,0.06); }
+  .check-tile.fail { border-color: rgba(248,81,73,0.25); background: rgba(248,81,73,0.06); }
+  .check-label { font-weight: 600; font-size: 0.88rem; color: #e6edf3; }
+  .check-detail { font-size: 0.78rem; color: #8b949e; margin-top: 2px; word-break: break-word; }
+  .log-panel {
+    background: #0b0e14;
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 12px;
+    font-family: 'JetBrains Mono', Consolas, monospace;
+    font-size: 0.78rem;
+  }
+  .log-line { line-height: 1.5; padding: 1px 0; }
+  .cta-row .q-btn { min-height: 44px; font-weight: 600; }
+  .license-big { font-size: 1.55rem; font-weight: 700; line-height: 1.2; }
+</style>
+"""
+
 LOG_STYLE = {
     "info": "color:#e6edf3",
     "ok": "color:#3fb950",
@@ -69,7 +166,7 @@ def _ensure_nicegui() -> bool:
         import subprocess
 
         subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "nicegui", "pywebview", "-q"],
+            [sys.executable, "-m", "pip", "install", "nicegui>=2.0.0", "pywebview>=5.0", "-q"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -95,7 +192,6 @@ class LauncherState:
     update_snoozed: bool = False
     setup_started: bool = False
     setup_busy: bool = False
-    log_expanded: bool = True
     last_progress_log_pct: int = -1
     checks_cache: list = field(default_factory=list)
 
@@ -109,17 +205,17 @@ class LauncherState:
 state = LauncherState()
 
 
-def _license_color(status: LicenseStatus) -> str:
+def _license_tone(status: LicenseStatus) -> tuple[str, str]:
     if not status.ok:
-        return "red"
+        return "negative", "Not activated"
     if status.expires == "dev":
-        return "green"
+        return "positive", "Active"
     days = status.remaining_days if status.remaining_days is not None else 999
     if days <= 0:
-        return "red"
+        return "negative", "Expired"
     if days <= 7:
-        return "orange"
-    return "green"
+        return "warning", "Active"
+    return "positive", "Active"
 
 
 def _append_log_line(text: str, level: str) -> None:
@@ -153,61 +249,53 @@ def _apply_log_event(event: LogEvent) -> None:
         short = event.text if len(event.text) <= 80 else event.text[:77] + "…"
         if short and not short.startswith("$ "):
             state.activity_text = short
-
     if event.text:
         _append_log_line(event.text, event.level)
+
+
+def _escape_html(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
 
 
 def build_ui() -> None:
     from nicegui import ui
 
     ui.dark_mode().enable()
-    ui.add_head_html(
-        """
-        <style>
-          body { background: #0f1117 !important; }
-          .studio-page { max-width: 920px; margin: 0 auto; }
-          .studio-card {
-            background: #1a1d2e !important;
-            border: 1px solid #30363d;
-            border-radius: 12px;
-            transition: box-shadow 0.25s ease, transform 0.2s ease;
-          }
-          .studio-card:hover { box-shadow: 0 4px 24px rgba(0,0,0,0.35); }
-          .log-line { font-family: Consolas, monospace; font-size: 0.82rem; line-height: 1.45; }
-          .nicegui-content { padding: 0 !important; }
-        </style>
-        """
-    )
+    ui.add_head_html(STUDIO_CSS)
+
+    # --- shared refs filled during layout ---
+    ui_refs: dict = {}
 
     # --- dialogs ---
     license_dialog = ui.dialog().props("persistent")
     machine_id = get_machine_id()
 
-    with license_dialog, ui.card().classes("w-[520px] studio-card"):
-        ui.label("Activate your license").classes("text-h6")
-        ui.label(f"Need a license? {LICENSE_CONTACT_HINT}").classes("text-caption text-grey")
-        ui.button("Open Telegram", on_click=lambda: webbrowser.open(LICENSE_CONTACT_URL)).props(
+    with license_dialog, ui.card().classes("studio-card w-[540px]"):
+        ui.label("Activate license").classes("text-h6 font-semibold")
+        ui.label(LICENSE_CONTACT_HINT).classes("studio-subtitle")
+        ui.button("Open Telegram", icon="send", on_click=lambda: webbrowser.open(LICENSE_CONTACT_URL)).props(
             "flat color=primary"
         )
         ui.input("Machine ID", value=machine_id).props("readonly outlined dense").classes("w-full")
         ui.button(
             "Copy Machine ID",
-            on_click=lambda: ui.run_javascript(
-                f"navigator.clipboard.writeText('{machine_id}')"
-            ),
+            icon="content_copy",
+            on_click=lambda: ui.run_javascript(f"navigator.clipboard.writeText('{machine_id}')"),
         ).props("outline dense")
-        key_input = ui.input("License key (VCPM-... or VCPM2...)").props("outlined dense").classes(
-            "w-full"
-        )
-        status_lbl = ui.label("").classes("text-caption")
+        key_input = ui.input("License key").props("outlined dense").classes("w-full")
+        dlg_status = ui.label("").classes("text-caption")
 
         def activate() -> None:
             key = (key_input.value or "").strip()
             if not key:
-                status_lbl.text = "Paste your license key first."
+                dlg_status.text = "Paste your license key first."
                 return
-            status_lbl.text = "Checking license…"
+            dlg_status.text = "Checking license…"
 
             def work() -> None:
                 try:
@@ -216,215 +304,209 @@ def build_ui() -> None:
                     result = LicenseStatus(False, str(exc))
 
                 def done() -> None:
-                    status_lbl.text = result.message
+                    dlg_status.text = result.message
                     if result.ok:
                         state.enqueue_log(result.message)
                         license_dialog.close()
-                        license_panel.refresh()
-                        ui.notify(
-                            f"License active — {result.remaining_label or ''}",
-                            type="positive",
-                        )
+                        ui_refs["license_panel"].refresh()
+                        ui.notify(f"License active — {result.remaining_label or ''}", type="positive")
 
                 ui.timer(0.01, done, once=True)
 
             threading.Thread(target=work, daemon=True).start()
 
-        with ui.row().classes("w-full justify-end gap-2"):
+        with ui.row().classes("w-full justify-end gap-2 mt-2"):
             ui.button("Cancel", on_click=license_dialog.close).props("flat")
-            ui.button("Activate license", on_click=activate).props("unelevated color=primary")
+            ui.button("Activate", on_click=activate).props("unelevated color=primary")
 
     update_dialog = ui.dialog()
     update_ui: dict = {}
 
-    with update_dialog, ui.card().classes("w-[480px] studio-card"):
+    with update_dialog, ui.card().classes("studio-card w-[500px]"):
         update_ui["title"] = ui.label().classes("text-h6")
-        update_ui["body"] = ui.label().classes("text-body2")
-
-        def apply_git() -> None:
-            update_dialog.close()
-            run_git_update()
-
-        def open_zip() -> None:
-            if state.update_status:
-                webbrowser.open(state.update_status.zip_url)
-            update_dialog.close()
-            ui.notify("Download ZIP and replace folder (keep data/license.json)", type="info")
-
-        with ui.row().classes("w-full justify-end gap-2"):
+        update_ui["body"] = ui.label().classes("studio-subtitle")
+        with ui.row().classes("w-full justify-end gap-2 mt-3"):
             ui.button("Later", on_click=update_dialog.close).props("flat")
-            update_ui["git_btn"] = ui.button(
-                "Git pull", on_click=apply_git
-            ).props("unelevated color=primary")
-            ui.button("Download ZIP", on_click=open_zip).props("outline")
+            update_ui["git_btn"] = ui.button("Git pull", on_click=lambda: (update_dialog.close(), run_git_update())).props(
+                "unelevated color=primary"
+            )
+            ui.button(
+                "Download ZIP",
+                on_click=lambda: (
+                    webbrowser.open(state.update_status.zip_url) if state.update_status else None,
+                    update_dialog.close(),
+                    ui.notify("Replace folder; keep data/license.json", type="info"),
+                ),
+            ).props("outline")
 
-    # --- header ---
-    with ui.column().classes("studio-page w-full gap-4 p-4"):
-        with ui.row().classes("items-center gap-4 w-full"):
-            if LOGO_HEADER.is_file():
-                ui.image(str(LOGO_HEADER)).classes("h-14")
-            elif ICON_PNG.is_file():
-                ui.image(str(ICON_PNG)).classes("h-14")
-            with ui.column().classes("gap-0"):
-                ui.label(STUDIO_NAME).classes("text-h5 font-bold")
-                ui.label("Voice studio · setup runs quietly in the background").classes(
-                    "text-caption text-grey"
-                )
+    with ui.column().classes("studio-shell w-full gap-4"):
+        # Hero header
+        with ui.element("div").classes("studio-hero w-full"):
+            with ui.row().classes("w-full items-center justify-between gap-4"):
+                with ui.row().classes("items-center gap-4"):
+                    if LOGO_HEADER.is_file():
+                        ui.image(str(LOGO_HEADER)).classes("h-12")
+                    elif ICON_PNG.is_file():
+                        ui.image(str(ICON_PNG)).classes("h-12")
+                    with ui.column().classes("gap-0"):
+                        ui.label(STUDIO_NAME).classes("text-h5 font-bold tracking-tight")
+                        ui.label("Professional voice studio · one-click setup").classes("studio-subtitle")
+                with ui.column().classes("items-end gap-1"):
+                    ui_refs["version_label"] = ui.label(f"v{get_studio_release_version()}").classes("studio-version")
+                    ui_refs["update_label"] = ui.label("").classes("text-caption text-warning")
 
-        @ui.refreshable
-        def license_panel() -> None:
-            status = current_license_status()
-            color = _license_color(status)
-            with ui.card().classes("studio-card w-full"):
-                with ui.row().classes("w-full items-start justify-between"):
-                    with ui.column().classes("gap-1"):
-                        ui.label(
-                            "Active" if status.ok else "Not activated",
-                        ).classes(f"text-h6 text-{color}")
-                        if status.ok:
-                            ui.label(status.remaining_label or "—").classes(
-                                f"text-h5 text-{color}"
-                            )
-                            ui.label(f"Expires {status.expires or '—'}").classes("text-caption")
-                            if status.source:
-                                ui.label(f"Type: {status.source}").classes("text-caption text-grey")
-                        else:
-                            ui.label(LICENSE_CONTACT_HINT).classes("text-body2")
-                            ui.label("Enter a license to use Open UI / Start Studio").classes(
-                                "text-caption text-grey"
-                            )
-                    ui.button("Enter license", on_click=license_dialog.open).props(
-                        "outline color=primary"
-                    )
-                if status.ok and status.remaining_days is not None and status.expires != "dev":
-                    ui.linear_progress(
-                        value=min(1.0, max(0.0, status.remaining_days / 365)),
-                        show_value=False,
-                    ).props(f'color="{color}"').classes("rounded")
+        # License + quick actions
+        with ui.row().classes("w-full gap-4 flex-col md:flex-row"):
+            @ui.refreshable
+            def license_panel() -> None:
+                status = current_license_status()
+                tone, label = _license_tone(status)
+                with ui.card().classes("studio-card flex-grow p-5"):
+                    ui.label("License").classes("studio-section-title")
+                    with ui.row().classes("w-full items-start justify-between gap-3"):
+                        with ui.column().classes("gap-1"):
+                            ui.badge(label, color=tone).props("outline")
+                            if status.ok:
+                                ui.label(status.remaining_label or "—").classes("license-big")
+                                ui.label(f"Expires {status.expires or '—'}").classes("studio-subtitle")
+                                if status.source:
+                                    ui.label(f"Type · {status.source}").classes("text-caption text-grey")
+                            else:
+                                ui.label(LICENSE_CONTACT_HINT).classes("studio-subtitle")
+                                ui.label("Activate to start Studio and open the UI").classes("text-caption text-grey")
+                        ui.button("Enter license", icon="vpn_key", on_click=license_dialog.open).props(
+                            "outline color=primary"
+                        )
+                    if status.ok and status.remaining_days is not None and status.expires != "dev":
+                        ui.linear_progress(
+                            value=min(1.0, max(0.0, status.remaining_days / 365)),
+                            show_value=False,
+                        ).props(f'color="{tone}" rounded').classes("mt-3")
 
-        license_panel()
+            ui_refs["license_panel"] = license_panel
+            license_panel()
 
-        with ui.card().classes("studio-card w-full"):
-            ui.label("Requirements").classes("text-subtitle1 font-medium mb-2")
-            checks_container = ui.row().classes("w-full gap-4 flex-wrap")
+            with ui.card().classes("studio-card p-5 min-w-[240px]"):
+                ui.label("Quick actions").classes("studio-section-title")
+                with ui.column().classes("gap-2 w-full"):
+                    ui_refs["setup_btn"] = ui.button(
+                        "Run setup", icon="build", on_click=lambda: run_setup()
+                    ).props("unelevated color=primary").classes("w-full")
+                    ui.button("Refresh checks", icon="refresh", on_click=lambda: refresh_checks()).props(
+                        "outline"
+                    ).classes("w-full")
+                    ui.button(
+                        "Check updates", icon="system_update", on_click=lambda: check_updates(manual=True)
+                    ).props("outline").classes("w-full")
+                    ui.button(
+                        "Get license", icon="chat", on_click=lambda: webbrowser.open(LICENSE_CONTACT_URL)
+                    ).props("flat color=primary").classes("w-full")
+
+        # Requirements grid
+        with ui.card().classes("studio-card w-full p-5"):
+            ui.label("System requirements").classes("studio-section-title")
+            checks_host = ui.element("div").classes("check-grid w-full")
 
             @ui.refreshable
             def checks_panel() -> None:
-                checks_container.clear()
-                with checks_container:
+                checks_host.clear()
+                with checks_host:
                     for item in state.checks_cache:
                         if item.ok:
-                            icon, chip_color = "check_circle", "green"
+                            css = "ok"
                         elif not item.required:
-                            icon, chip_color = "warning", "orange"
+                            css = "warn"
                         else:
-                            icon, chip_color = "cancel", "red"
-                        with ui.column().classes("gap-0 min-w-[200px]"):
-                            with ui.row().classes("items-center gap-1"):
-                                ui.icon(icon, color=chip_color).classes("text-sm")
-                                ui.label(item.label).classes("text-body2 font-medium")
-                            ui.label(item.detail).classes("text-caption text-grey pl-6")
+                            css = "fail"
+                        with ui.element("div").classes(f"check-tile {css}"):
+                            ui.label(item.label).classes("check-label")
+                            ui.label(item.detail).classes("check-detail")
 
+            ui_refs["checks_panel"] = checks_panel
             checks_panel()
 
-        with ui.row().classes("gap-2 flex-wrap"):
-            ui.button("Refresh checks", icon="refresh", on_click=lambda: refresh_checks()).props(
-                "outline"
-            )
-            setup_btn = ui.button("Run setup", icon="build", on_click=lambda: run_setup()).props(
-                "unelevated color=primary"
-            )
-            ui.button("Enter license", icon="vpn_key", on_click=license_dialog.open).props("outline")
-            ui.button(
-                "Get a license",
-                icon="chat",
-                on_click=lambda: webbrowser.open(LICENSE_CONTACT_URL),
-            ).props("flat")
-            ui.button(
-                "Check for updates",
-                icon="system_update",
-                on_click=lambda: check_updates(manual=True),
-            ).props("outline")
+        # Studio control
+        with ui.card().classes("studio-card w-full p-5"):
+            ui.label("Studio control").classes("studio-section-title")
+            with ui.row().classes("w-full items-center justify-between flex-wrap gap-4"):
+                ui_refs["server_status"] = ui.html(
+                    '<div class="status-pill stopped"><span class="status-dot"></span>Stopped</div>'
+                )
+                with ui.row().classes("gap-2 cta-row"):
+                    ui.button("Open UI", icon="open_in_new", on_click=lambda: open_ui()).props(
+                        "outline color=primary"
+                    )
+                    ui.button("Stop", icon="stop_circle", on_click=lambda: stop_servers()).props(
+                        "outline color=negative"
+                    )
+                    ui.button("Start Studio", icon="play_circle", on_click=lambda: start_studio()).props(
+                        "unelevated color=positive"
+                    ).classes("px-6")
 
-        with ui.card().classes("studio-card w-full"):
+        # Activity log
+        with ui.expansion("Activity log", icon="terminal", value=True).classes("studio-card w-full"):
+            ui_refs["activity_label"] = ui.label("Idle").classes("text-body2 font-medium")
+            ui_refs["progress_bar"] = ui.linear_progress(value=0, show_value=False).props(
+                "color=primary rounded"
+            )
             with ui.row().classes("w-full items-center justify-between"):
-                server_status = ui.label("Status: Stopped").classes("text-subtitle1 font-bold")
-                with ui.row().classes("gap-2"):
-                    ui.button(
-                        "Open UI", icon="open_in_browser", on_click=lambda: open_ui()
-                    ).props("unelevated color=primary")
-                    ui.button(
-                        "Stop", icon="stop", on_click=lambda: stop_servers()
-                    ).props("outline color=negative")
-                    ui.button(
-                        "Start Studio", icon="play_arrow", on_click=lambda: start_studio()
-                    ).props("unelevated color=positive")
-
-        with ui.expansion("Activity log", icon="terminal", value=True).classes(
-            "studio-card w-full"
-        ) as log_expansion:
-            activity_label = ui.label("Idle").classes("text-body2 font-medium")
-            progress_bar = ui.linear_progress(value=0, show_value=False).props("color=positive")
-            progress_pct_label = ui.label("").classes("text-caption text-positive")
-            progress_detail_label = ui.label("").classes("text-caption text-grey log-line")
-
-            with ui.row().classes("w-full justify-end"):
-                ui.button(
-                    "Clear log", icon="delete_outline", on_click=lambda: clear_log()
-                ).props("flat dense")
-
-            log_scroll = ui.scroll_area().classes("w-full h-56 bg-[#0d1117] rounded-lg p-2")
+                ui_refs["progress_pct_label"] = ui.label("").classes("text-caption text-primary")
+                ui_refs["progress_detail_label"] = ui.label("").classes("text-caption text-grey log-line")
+            ui.button("Clear log", icon="delete_sweep", on_click=lambda: clear_log()).props("flat dense")
+            log_scroll = ui.scroll_area().classes("log-panel w-full h-52 p-3 mt-2")
             with log_scroll:
-                log_column = ui.column().classes("w-full gap-0")
+                ui_refs["log_column"] = ui.column().classes("w-full gap-0")
 
-        with ui.row().classes("w-full justify-between items-center text-caption text-grey"):
-            ui.label(f"License support: {LICENSE_CONTACT_LABEL}")
-            with ui.row().classes("gap-3 items-center"):
-                update_label = ui.label("")
-                version_label = ui.label(f"v{get_studio_release_version()}")
+        with ui.row().classes("w-full justify-between items-center text-caption text-grey pt-1"):
+            ui.label(f"Support · {LICENSE_CONTACT_LABEL}")
+            ui.link("Telegram", LICENSE_CONTACT_URL).classes("text-primary")
 
-    # --- UI update helpers ---
+    # --- handlers ---
     def rebuild_log_view() -> None:
-        log_column.clear()
-        with log_column:
+        col = ui_refs["log_column"]
+        col.clear()
+        with col:
             for level, text in state.log_lines:
                 style = LOG_STYLE.get(level, LOG_STYLE["info"])
                 ui.html(f'<div class="log-line" style="{style}">{_escape_html(text)}</div>')
 
     def sync_progress_ui() -> None:
-        activity_label.text = state.activity_text
-        progress_detail_label.text = state.progress_detail
+        ui_refs["activity_label"].text = state.activity_text
+        ui_refs["progress_detail_label"].text = state.progress_detail
+        bar = ui_refs["progress_bar"]
         if state.progress_indeterminate:
-            progress_bar.props('indeterminate')
+            bar.props("indeterminate")
         else:
-            progress_bar.props(remove='indeterminate')
-            progress_bar.value = state.progress_pct / 100.0
-            progress_pct_label.text = f"{int(state.progress_pct)}%" if state.progress_pct else ""
+            bar.props(remove="indeterminate")
+            bar.value = state.progress_pct / 100.0
+            ui_refs["progress_pct_label"].text = f"{int(state.progress_pct)}%" if state.progress_pct else ""
+
+    def set_server_status(running: bool) -> None:
+        cls = "running" if running else "stopped"
+        label = "Running" if running else "Stopped"
+        ui_refs["server_status"].content = (
+            f'<div class="status-pill {cls}"><span class="status-dot"></span>{label}</div>'
+        )
 
     def poll_log() -> None:
         changed = False
-        batch = 0
-        while batch < 40:
+        for _ in range(40):
             try:
                 event = state.log_queue.get_nowait()
             except queue.Empty:
                 break
             _apply_log_event(event)
             changed = True
-            batch += 1
         if changed:
             rebuild_log_view()
             sync_progress_ui()
 
     def poll_servers() -> None:
         up = state.manager.running or (_port_open(8000) and _port_open(3000))
-        server_status.text = "Status: Running" if up else "Status: Stopped"
+        set_server_status(up)
         if up != state.servers_up:
             state.servers_up = up
             refresh_checks()
-
-    def poll_license() -> None:
-        license_panel.refresh()
 
     def refresh_checks() -> None:
         if state.checks_busy:
@@ -436,7 +518,7 @@ def build_ui() -> None:
 
             def done() -> None:
                 state.checks_cache = checks
-                checks_panel.refresh()
+                ui_refs["checks_panel"].refresh()
                 state.checks_busy = False
 
             ui.timer(0.01, done, once=True)
@@ -450,10 +532,8 @@ def build_ui() -> None:
 
     def set_setup_busy(busy: bool) -> None:
         state.setup_busy = busy
-        if busy:
-            setup_btn.disable()
-        else:
-            setup_btn.enable()
+        btn = ui_refs["setup_btn"]
+        (btn.disable if busy else btn.enable)()
 
     def auto_setup() -> None:
         state.activity_text = "Checking install requirements…"
@@ -481,7 +561,6 @@ def build_ui() -> None:
         state.progress_indeterminate = True
         set_setup_busy(True)
         sync_progress_ui()
-        log_expansion.value = True
 
         def work() -> None:
             try:
@@ -503,7 +582,7 @@ def build_ui() -> None:
         threading.Thread(target=work, daemon=True).start()
 
     def ensure_licensed() -> bool:
-        license_panel.refresh()
+        ui_refs["license_panel"].refresh()
         if current_license_status().ok:
             return True
         license_dialog.open()
@@ -515,13 +594,8 @@ def build_ui() -> None:
 
         def work() -> None:
             checks = run_checks()
-            ready = all(c.ok for c in checks if c.required and c.key != "servers")
-            if not ready:
-                ui.timer(
-                    0.01,
-                    lambda: ui.notify("Some requirements are missing — run Setup first.", type="warning"),
-                    once=True,
-                )
+            if not all(c.ok for c in checks if c.required and c.key != "servers"):
+                ui.timer(0.01, lambda: ui.notify("Run Setup first — some requirements are missing.", type="warning"), once=True)
                 return
             state.manager.start(open_browser=True)
             ui.timer(0.01, wait_and_refresh, once=True)
@@ -539,13 +613,8 @@ def build_ui() -> None:
         def work() -> None:
             if not state.manager.running and not (_port_open(8000) and _port_open(3000)):
                 checks = run_checks()
-                ready = all(c.ok for c in checks if c.required and c.key != "servers")
-                if not ready:
-                    ui.timer(
-                        0.01,
-                        lambda: ui.notify("Finish setup first, then open the UI.", type="warning"),
-                        once=True,
-                    )
+                if not all(c.ok for c in checks if c.required and c.key != "servers"):
+                    ui.timer(0.01, lambda: ui.notify("Finish setup first.", type="warning"), once=True)
                     return
                 if not state.manager.start(open_browser=False):
                     return
@@ -565,11 +634,8 @@ def build_ui() -> None:
 
     def set_update_ui(status: UpdateStatus) -> None:
         state.update_status = status
-        if status.update_available:
-            update_label.text = f"Update available: v{status.latest}"
-        else:
-            update_label.text = ""
-        version_label.text = f"v{get_studio_release_version()}"
+        ui_refs["update_label"].text = f"Update · v{status.latest}" if status.update_available else ""
+        ui_refs["version_label"].text = f"v{get_studio_release_version()}"
 
     def show_update_dialog(status: UpdateStatus) -> None:
         set_update_ui(status)
@@ -615,14 +681,8 @@ def build_ui() -> None:
                 status = check_for_updates()
             except Exception:
                 return
-            if not status.update_available:
-                return
-
-            def notify() -> None:
-                set_update_ui(status)
-                show_update_dialog(status)
-
-            ui.timer(0.01, notify, once=True)
+            if status.update_available:
+                ui.timer(0.01, lambda: show_update_dialog(status), once=True)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -633,7 +693,7 @@ def build_ui() -> None:
             ok, msg = apply_git_update(state.enqueue_log)
 
             def done() -> None:
-                version_label.text = f"v{get_studio_release_version()}"
+                ui_refs["version_label"].text = f"v{get_studio_release_version()}"
                 if ok:
                     state.update_snoozed = True
                     ui.notify(msg, type="positive")
@@ -645,10 +705,9 @@ def build_ui() -> None:
 
         threading.Thread(target=work, daemon=True).start()
 
-    # timers
     ui.timer(0.15, poll_log)
     ui.timer(3.0, poll_servers)
-    ui.timer(60.0, poll_license)
+    ui.timer(60.0, lambda: ui_refs["license_panel"].refresh())
     ui.timer(5.0, check_updates_quiet, once=True)
     ui.timer(0.5, refresh_checks, once=True)
 
@@ -658,42 +717,29 @@ def build_ui() -> None:
         ui.timer(0.3, auto_setup, once=True)
 
 
-def _escape_html(text: str) -> str:
-    return (
-        text.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
-
-
 def main() -> None:
     if not _ensure_nicegui():
-        _run_tk_fallback("NiceGUI not installed — using classic launcher. Run Setup, then restart.")
+        _run_tk_fallback("NiceGUI not installed — run Setup once, then restart Studio.")
         return
 
-    from nicegui import ui
+    from nicegui import app, ui
 
-    try:
-        build_ui()
+    @app.on_shutdown
+    def _shutdown() -> None:
+        if state.manager.running:
+            state.manager.stop()
 
-        def on_shutdown() -> None:
-            if state.manager.running:
-                state.manager.stop()
-
-        ui.on_shutdown(on_shutdown)
-        favicon = str(ICON_ICO) if ICON_ICO.is_file() else str(ICON_PNG) if ICON_PNG.is_file() else None
-        ui.run(
-            native=True,
-            port=LAUNCHER_PORT,
-            reload=False,
-            title=STUDIO_NAME,
-            window_size=(920, 860),
-            favicon=favicon,
-        )
-    except Exception as exc:
-        print(f"NiceGUI launcher failed: {exc}", file=sys.stderr)
-        _run_tk_fallback(f"NiceGUI error ({exc}) — using classic launcher.")
+    favicon = str(ICON_ICO) if ICON_ICO.is_file() else str(ICON_PNG) if ICON_PNG.is_file() else None
+    ui.run(
+        build_ui,
+        native=True,
+        port=LAUNCHER_PORT,
+        reload=False,
+        title=STUDIO_NAME,
+        window_size=(980, 900),
+        favicon=favicon,
+        show_welcome_message=False,
+    )
 
 
 if __name__ == "__main__":
