@@ -350,13 +350,15 @@ def build_ui() -> None:
             with ui.row().classes("w-full items-center justify-between"):
                 server_status = ui.label("Status: Stopped").classes("text-subtitle1 font-bold")
                 with ui.row().classes("gap-2"):
-                    ui.button("Open UI", icon="open_in_browser", on_click=open_ui).props(
-                        "unelevated color=primary"
-                    )
-                    ui.button("Stop", icon="stop", on_click=stop_servers).props("outline color=negative")
-                    ui.button("Start Studio", icon="play_arrow", on_click=start_studio).props(
-                        "unelevated color=positive"
-                    )
+                    ui.button(
+                        "Open UI", icon="open_in_browser", on_click=lambda: open_ui()
+                    ).props("unelevated color=primary")
+                    ui.button(
+                        "Stop", icon="stop", on_click=lambda: stop_servers()
+                    ).props("outline color=negative")
+                    ui.button(
+                        "Start Studio", icon="play_arrow", on_click=lambda: start_studio()
+                    ).props("unelevated color=positive")
 
         with ui.expansion("Activity log", icon="terminal", value=True).classes(
             "studio-card w-full"
@@ -367,9 +369,9 @@ def build_ui() -> None:
             progress_detail_label = ui.label("").classes("text-caption text-grey log-line")
 
             with ui.row().classes("w-full justify-end"):
-                ui.button("Clear log", icon="delete_outline", on_click=clear_log).props(
-                    "flat dense"
-                )
+                ui.button(
+                    "Clear log", icon="delete_outline", on_click=lambda: clear_log()
+                ).props("flat dense")
 
             log_scroll = ui.scroll_area().classes("w-full h-56 bg-[#0d1117] rounded-lg p-2")
             with log_scroll:
@@ -672,22 +674,26 @@ def main() -> None:
 
     from nicegui import ui
 
-    build_ui()
+    try:
+        build_ui()
 
-    def on_shutdown() -> None:
-        if state.manager.running:
-            state.manager.stop()
+        def on_shutdown() -> None:
+            if state.manager.running:
+                state.manager.stop()
 
-    ui.on_shutdown(on_shutdown)
-    favicon = str(ICON_ICO) if ICON_ICO.is_file() else str(ICON_PNG) if ICON_PNG.is_file() else None
-    ui.run(
-        native=True,
-        port=LAUNCHER_PORT,
-        reload=False,
-        title=STUDIO_NAME,
-        window_size=(920, 860),
-        favicon=favicon,
-    )
+        ui.on_shutdown(on_shutdown)
+        favicon = str(ICON_ICO) if ICON_ICO.is_file() else str(ICON_PNG) if ICON_PNG.is_file() else None
+        ui.run(
+            native=True,
+            port=LAUNCHER_PORT,
+            reload=False,
+            title=STUDIO_NAME,
+            window_size=(920, 860),
+            favicon=favicon,
+        )
+    except Exception as exc:
+        print(f"NiceGUI launcher failed: {exc}", file=sys.stderr)
+        _run_tk_fallback(f"NiceGUI error ({exc}) — using classic launcher.")
 
 
 if __name__ == "__main__":
