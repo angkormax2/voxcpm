@@ -528,13 +528,22 @@ def download_voxcpm2_weights(log: LogFn) -> bool:
 
     dest = PROJECT_ROOT / "VoxCPM2"
     dest.mkdir(parents=True, exist_ok=True)
+    log("PHASE|58|Downloading VoxCPM2 model")
     log("Downloading VoxCPM2 weights (first time only, several GB)…")
     log("This may take several minutes depending on your connection.")
 
     script = (
         "from huggingface_hub import snapshot_download\n"
+        "from tqdm.auto import tqdm\n\n"
+        "class ProgressTqdm(tqdm):\n"
+        "    def update(self, n=1):\n"
+        "        super().update(n)\n"
+        "        if self.total:\n"
+        "            pct = min(100, int(100 * self.n / self.total))\n"
+        "            label = self.desc or 'Downloading model files'\n"
+        "            print(f'PROGRESS|{pct}|{label}', flush=True)\n\n"
         f"dest = r'{dest}'\n"
-        f"snapshot_download(repo_id='{HF_VOXCPM2_REPO}', local_dir=dest)\n"
+        f"snapshot_download(repo_id='{HF_VOXCPM2_REPO}', local_dir=dest, tqdm_class=ProgressTqdm)\n"
         "print('Download complete:', dest)\n"
     )
     rc = _run_live(
@@ -544,6 +553,7 @@ def download_voxcpm2_weights(log: LogFn) -> bool:
     if rc != 0 or not MODEL_CONFIG.is_file():
         log("Model download failed. Check your internet connection and try Setup again.")
         return False
+    log("PHASE|72|Model download complete")
     log("VoxCPM2 weights downloaded.")
     return True
 
@@ -772,6 +782,7 @@ def wait_for_servers(timeout_sec: int = 90) -> bool:
 
 def bootstrap_setup(manager: StudioManager) -> bool:
     """Install dependencies if needed — no license required."""
+    manager.log("PHASE|8|Checking prerequisites")
     if not ensure_prerequisites(manager.log):
         return False
     manager.log("Checking requirements…")
@@ -780,6 +791,7 @@ def bootstrap_setup(manager: StudioManager) -> bool:
         if not manager.setup():
             manager.log("Setup failed. Open setup log for details, then click Run setup again.")
             return False
+    manager.log("PHASE|100|Setup check complete")
     manager.log("Setup check complete.")
     return True
 
@@ -867,9 +879,11 @@ class StudioManager:
 
     def setup(self) -> bool:
         self.log("=== Setup started ===")
+        self.log("PHASE|10|Checking prerequisites")
         if not ensure_prerequisites(self.log):
             return False
 
+        self.log("PHASE|18|Preparing Python environment")
         py_exe = _ensure_studio_python(self.log)
         if not py_exe:
             return False
@@ -896,6 +910,7 @@ class StudioManager:
 
         if not torch_ok:
             index = TORCH_CUDA_INDEX if has_nvidia else TORCH_CPU_INDEX
+            self.log("PHASE|32|Installing PyTorch")
             self.log(f"Installing PyTorch ({'CUDA' if has_nvidia else 'CPU'})…")
             _run(
                 pip + ["install", "torch", "torchaudio", "--index-url", index],
@@ -903,6 +918,7 @@ class StudioManager:
                 env=_pip_env(),
             )
 
+        self.log("PHASE|45|Installing Python packages")
         if not _pip_install_project(pip, self.log):
             self.log("Python install failed.")
             return False
@@ -910,6 +926,7 @@ class StudioManager:
         if not download_voxcpm2_weights(self.log):
             return False
 
+        self.log("PHASE|78|Installing frontend packages")
         npm_cmd = _npm_command("install", "--no-audit", "--no-fund", "--loglevel=error")
         if not npm_cmd:
             self.log("npm missing — installing Node.js LTS, then retrying…")
@@ -925,6 +942,7 @@ class StudioManager:
             self.log("npm install failed.")
             return False
 
+        self.log("PHASE|100|Setup finished")
         self.log("=== Setup finished ===")
         return True
 

@@ -22,6 +22,7 @@ from studio_branding import (
     STUDIO_NAME,
     get_studio_release_version,
 )
+from studio_log import LogEvent, parse_log_message
 from studio_update import UpdateStatus, apply_git_update, check_for_updates
 from launcher_core import (
     PROJECT_ROOT,
@@ -56,10 +57,11 @@ class StudioLauncherApp:
         self.root.minsize(620, 560)
         self.root.configure(bg=BG)
 
-        self.log_queue: queue.Queue[str] = queue.Queue()
+        self.log_queue: queue.Queue[LogEvent] = queue.Queue()
         self.manager = StudioManager(log=self._enqueue_log)
         self._checks_busy = False
         self._log_line_count = 0
+        self._activity_busy = False
         self._window_icon: tk.PhotoImage | None = None
         self._header_logo: tk.PhotoImage | None = None
         self._setup_started = False
@@ -86,31 +88,83 @@ class StudioLauncherApp:
             threading.Thread(target=self._auto_setup, daemon=True).start()
 
     def _auto_setup(self) -> None:
+        self.root.after(0, self._show_log_panel_if_hidden)
+        self.root.after(0, lambda: self._begin_activity("Checking install requirements…"))
         self._enqueue_log("Checking install requirements (no license needed for setup)…")
+        success = True
         try:
-            bootstrap_setup(self.manager)
+            success = bootstrap_setup(self.manager)
         except Exception as exc:
             self._enqueue_log(f"Setup error: {exc}")
+            success = False
+        finally:
+            self.root.after(0, lambda s=success: self._finish_activity(success=s))
         self.root.after(0, self.refresh_checks_async)
 
     def _enqueue_log(self, msg: str) -> None:
-        self.log_queue.put(msg)
+        self.log_queue.put(parse_log_message(msg))
+
+    def _begin_activity(self, text: str) -> None:
+        self._activity_var.set(text)
+        self._log_progress.configure(mode="indeterminate")
+        self._log_progress.start(10)
+        self._log_pct_var.set("")
+        self._activity_busy = True
+
+    def _finish_activity(self, *, success: bool = True) -> None:
+        if self._activity_busy:
+            self._log_progress.stop()
+            self._log_progress.configure(mode="determinate")
+            self._activity_busy = False
+        self._log_progress["value"] = 100 if success else 0
+        self._log_pct_var.set("100%" if success else "")
+        self._activity_var.set("Ready" if success else "Setup needs attention")
+
+    def _set_log_progress(self, pct: float, text: str = "") -> None:
+        if self._activity_busy:
+            self._log_progress.stop()
+            self._log_progress.configure(mode="determinate")
+            self._activity_busy = False
+        pct = max(0.0, min(100.0, pct))
+        self._log_progress["value"] = pct
+        self._log_pct_var.set(f"{int(pct)}%")
+        if text:
+            self._activity_var.set(text)
+
+    def _apply_log_event(self, event: LogEvent) -> None:
+        if event.progress is not None:
+            self._set_log_progress(event.progress, event.progress_text or event.text)
+        elif event.level == "title":
+            lower = event.text.lower()
+            if "started" in lower:
+                self._begin_activity(event.text)
+            elif "finished" in lower or "complete" in lower:
+                self._finish_activity(success=True)
+        elif event.level in ("warn", "cmd", "info", "ok", "err") and self._activity_busy:
+            short = event.text if len(event.text) <= 72 else event.text[:69] + "…"
+            if not short.startswith("$ "):
+                self._activity_var.set(short)
+
+        if not event.text:
+            return
+
+        self.log_box.configure(state="normal")
+        self.log_box.insert(tk.END, event.text + "\n", (event.level,))
+        self._log_line_count += 1
+        if self._log_line_count > MAX_LOG_LINES:
+            self.log_box.delete("1.0", f"{self._log_line_count - MAX_LOG_LINES}.0")
+            self._log_line_count = MAX_LOG_LINES
+        self.log_box.see(tk.END)
+        self.log_box.configure(state="disabled")
 
     def _poll_log(self) -> None:
         batch = 0
         while batch < 40:
             try:
-                line = self.log_queue.get_nowait()
+                event = self.log_queue.get_nowait()
             except queue.Empty:
                 break
-            self.log_box.configure(state="normal")
-            self.log_box.insert(tk.END, line + "\n")
-            self._log_line_count += 1
-            if self._log_line_count > MAX_LOG_LINES:
-                self.log_box.delete("1.0", f"{self._log_line_count - MAX_LOG_LINES}.0")
-                self._log_line_count = MAX_LOG_LINES
-            self.log_box.see(tk.END)
-            self.log_box.configure(state="disabled")
+            self._apply_log_event(event)
             batch += 1
         self.root.after(150, self._poll_log)
 
@@ -426,30 +480,109 @@ class StudioLauncherApp:
 
         log_toggle_row = tk.Frame(self.root, bg=BG)
         log_toggle_row.pack(fill="x", padx=16, pady=(4, 0))
-        self.log_toggle_btn = ttk.Button(log_toggle_row, text="Show setup log", command=self._toggle_log)
+        self.log_toggle_btn = ttk.Button(log_toggle_row, text="Show activity log", command=self._toggle_log)
         self.log_toggle_btn.pack(side="left")
+        tk.Label(
+            log_toggle_row,
+            text="Setup progress, downloads, and server messages",
+            font=("Segoe UI", 9),
+            fg=MUTED,
+            bg=BG,
+        ).pack(side="left", padx=(10, 0))
 
         self.log_frame = tk.LabelFrame(
             self.root,
-            text=" Log ",
+            text=" Activity log ",
             font=("Segoe UI", 10, "bold"),
             fg=TEXT,
             bg=PANEL,
             labelanchor="n",
+            highlightbackground="#30363d",
+            highlightthickness=1,
         )
-        # Log hidden until user asks — keeps the window clean (no extra CMD).
+        # Hidden by default; auto-opens during setup.
 
+        log_header = tk.Frame(self.log_frame, bg=PANEL)
+        log_header.pack(fill="x", padx=10, pady=(10, 4))
+
+        tk.Label(
+            log_header,
+            text="Current task",
+            font=("Segoe UI", 8),
+            fg=MUTED,
+            bg=PANEL,
+        ).pack(anchor="w")
+        self._activity_var = tk.StringVar(value="Idle")
+        tk.Label(
+            log_header,
+            textvariable=self._activity_var,
+            font=("Segoe UI", 10, "bold"),
+            fg=TEXT,
+            bg=PANEL,
+            anchor="w",
+        ).pack(fill="x", pady=(2, 0))
+
+        progress_row = tk.Frame(self.log_frame, bg=PANEL)
+        progress_row.pack(fill="x", padx=10, pady=(0, 6))
+
+        style = ttk.Style(self.root)
+        style.configure(
+            "Studio.Horizontal.TProgressbar",
+            troughcolor="#0d1117",
+            background=OK,
+            darkcolor=OK,
+            lightcolor=OK,
+            bordercolor=PANEL,
+            thickness=10,
+        )
+        self._log_progress = ttk.Progressbar(
+            progress_row,
+            maximum=100,
+            mode="determinate",
+            style="Studio.Horizontal.TProgressbar",
+        )
+        self._log_progress.pack(side="left", fill="x", expand=True)
+        self._log_pct_var = tk.StringVar(value="")
+        tk.Label(
+            progress_row,
+            textvariable=self._log_pct_var,
+            font=("Consolas", 9, "bold"),
+            fg=OK,
+            bg=PANEL,
+            width=5,
+        ).pack(side="right", padx=(8, 0))
+
+        log_toolbar = tk.Frame(self.log_frame, bg=PANEL)
+        log_toolbar.pack(fill="x", padx=10, pady=(0, 4))
+        ttk.Button(log_toolbar, text="Clear log", command=self._clear_log).pack(side="right")
+
+        log_colors = {
+            "info": TEXT,
+            "ok": OK,
+            "warn": WARN,
+            "err": ERR,
+            "cmd": "#79c0ff",
+            "dim": MUTED,
+            "title": "#a371f7",
+        }
         self.log_box = scrolledtext.ScrolledText(
             self.log_frame,
-            height=14,
+            height=12,
             font=("Consolas", 9),
             bg="#0d1117",
             fg=TEXT,
             insertbackground=TEXT,
             relief="flat",
+            highlightthickness=1,
+            highlightbackground="#21262d",
+            highlightcolor="#21262d",
             state="disabled",
+            wrap="word",
         )
-        self.log_box.pack(fill="both", expand=True, padx=8, pady=8)
+        for tag, color in log_colors.items():
+            font = ("Consolas", 9, "bold") if tag == "title" else ("Consolas", 9)
+            self.log_box.tag_configure(tag, foreground=color, font=font)
+        self.log_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
         foot = tk.Frame(self.root, bg=BG)
         foot.pack(fill="x", padx=16, pady=(8, 10))
@@ -680,15 +813,25 @@ class StudioLauncherApp:
         self.license_progress = ttk.Progressbar(inner, maximum=100, mode="determinate")
         self.license_progress.pack_forget()
 
+    def _show_log_panel_if_hidden(self) -> None:
+        if not self._log_visible:
+            self._toggle_log()
+
+    def _clear_log(self) -> None:
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", tk.END)
+        self.log_box.configure(state="disabled")
+        self._log_line_count = 0
+
     def _toggle_log(self) -> None:
         if self._log_visible:
             self.log_frame.pack_forget()
             self._log_visible = False
-            self.log_toggle_btn.configure(text="Show setup log")
+            self.log_toggle_btn.configure(text="Show activity log")
         else:
             self.log_frame.pack(fill="both", expand=True, padx=16, pady=(8, 12))
             self._log_visible = True
-            self.log_toggle_btn.configure(text="Hide setup log")
+            self.log_toggle_btn.configure(text="Hide activity log")
 
     def _apply_checks(self, checks) -> None:
         for child in self.req_grid.winfo_children():
@@ -738,8 +881,22 @@ class StudioLauncherApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def _run_setup(self) -> None:
+        self.root.after(0, self._show_log_panel_if_hidden)
+        self.root.after(0, lambda: self._begin_activity("Running setup…"))
         self._enqueue_log("Running setup…")
-        self._run_async(self.manager.setup)
+
+        def work() -> None:
+            try:
+                ok = self.manager.setup()
+                if not ok:
+                    self.root.after(0, lambda: self._finish_activity(success=False))
+            except Exception as exc:
+                self._enqueue_log(f"Error: {exc}")
+                self.root.after(0, lambda: self._finish_activity(success=False))
+            finally:
+                self.root.after(0, self.refresh_checks_async)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _start(self) -> None:
         if not self._ensure_licensed():
