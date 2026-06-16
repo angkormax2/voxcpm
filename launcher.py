@@ -1,4 +1,4 @@
-"""VoxCPM2 Studio — graphical launcher (replaces CMD workflow)."""
+"""VoxCPM2 Studio — NiceGUI launcher (native window, smooth dark UI)."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ import queue
 import sys
 import threading
 import webbrowser
-import tkinter as tk
-from tkinter import messagebox, scrolledtext, ttk
+from dataclasses import dataclass, field
+from pathlib import Path
 
 from license_manager import (
     LicenseStatus,
@@ -29,361 +29,185 @@ from launcher_core import (
     StudioManager,
     _port_open,
     bootstrap_setup,
-    center_tk_window,
     run_checks,
     wait_for_servers,
 )
 
 ASSETS = PROJECT_ROOT / "assets"
 ICON_ICO = ASSETS / "studio_launcher.ico"
-ICON_PNG = ASSETS / "studio_icon.png"
 LOGO_HEADER = ASSETS / "studio_logo_header.png"
-
-BG = "#0f1117"
-PANEL = "#1a1d2e"
-TEXT = "#e6edf3"
-MUTED = "#8b949e"
-OK = "#3fb950"
-WARN = "#d29922"
-ERR = "#f85149"
+ICON_PNG = ASSETS / "studio_icon.png"
+LAUNCHER_PORT = 8765
 MAX_LOG_LINES = 400
 
+LOG_STYLE = {
+    "info": "color:#e6edf3",
+    "ok": "color:#3fb950",
+    "warn": "color:#d29922",
+    "err": "color:#f85149",
+    "cmd": "color:#79c0ff",
+    "dim": "color:#8b949e",
+    "title": "color:#a371f7;font-weight:600",
+}
 
-class StudioLauncherApp:
-    def __init__(self) -> None:
-        self.root = tk.Tk()
-        self.root.title(STUDIO_NAME)
-        self.root.geometry("740x680")
-        self.root.minsize(620, 560)
-        self.root.configure(bg=BG)
 
-        self.log_queue: queue.Queue[LogEvent] = queue.Queue()
-        self.manager = StudioManager(log=self._enqueue_log)
-        self._checks_busy = False
-        self._log_line_count = 0
-        self._activity_busy = False
-        self._last_progress_log_pct = -1
-        self._window_icon: tk.PhotoImage | None = None
-        self._header_logo: tk.PhotoImage | None = None
-        self._setup_started = False
-        self._log_visible = False
-        self._servers_up = False
-        self._update_status: UpdateStatus | None = None
-        self._update_snoozed = False
+def _run_tk_fallback(reason: str) -> None:
+    print(reason, file=sys.stderr)
+    from launcher_tk import main as tk_main
 
-        self._set_window_icon()
-        self._build_main_ui()
-        center_tk_window(self.root, width=740, height=680)
+    tk_main()
 
-        self.root.after(150, self._poll_log)
-        self.root.after(500, self.refresh_checks_async)
-        self.root.after(3000, self._poll_server_status)
-        self.root.after(1000, self._poll_access_status)
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.root.after(5000, self._check_updates_quiet)
 
-        self._enqueue_log(f"Welcome to {STUDIO_NAME}")
-        self._refresh_license_panel()
-        if not self._setup_started:
-            self._setup_started = True
-            threading.Thread(target=self._auto_setup, daemon=True).start()
+def _ensure_nicegui() -> bool:
+    try:
+        import nicegui  # noqa: F401
 
-    def _auto_setup(self) -> None:
-        self.root.after(0, self._show_log_panel_if_hidden)
-        self.root.after(0, lambda: self._begin_activity("Checking install requirements…"))
-        self._enqueue_log("Checking install requirements (no license needed for setup)…")
-        success = True
-        try:
-            success = bootstrap_setup(self.manager)
-        except Exception as exc:
-            self._enqueue_log(f"Setup error: {exc}")
-            success = False
-        finally:
-            self.root.after(0, lambda s=success: self._finish_activity(success=s))
-        self.root.after(0, self.refresh_checks_async)
+        return True
+    except ImportError:
+        pass
+    try:
+        import subprocess
 
-    def _enqueue_log(self, msg: str) -> None:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "nicegui", "pywebview", "-q"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        import nicegui  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+@dataclass
+class LauncherState:
+    log_queue: queue.Queue[LogEvent] = field(default_factory=queue.Queue)
+    manager: StudioManager = field(default_factory=lambda: StudioManager())
+    checks_busy: bool = False
+    log_lines: list[tuple[str, str]] = field(default_factory=list)
+    activity_text: str = "Idle"
+    progress_pct: float = 0.0
+    progress_detail: str = ""
+    progress_indeterminate: bool = False
+    servers_up: bool = False
+    update_status: UpdateStatus | None = None
+    update_snoozed: bool = False
+    setup_started: bool = False
+    setup_busy: bool = False
+    log_expanded: bool = True
+    last_progress_log_pct: int = -1
+    checks_cache: list = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.manager = StudioManager(log=self.enqueue_log)
+
+    def enqueue_log(self, msg: str) -> None:
         self.log_queue.put(parse_log_message(msg))
 
-    def _begin_activity(self, text: str) -> None:
-        self._activity_var.set(text)
-        self._log_progress.configure(mode="indeterminate")
-        self._log_progress.start(10)
-        self._log_pct_var.set("")
-        self._activity_busy = True
 
-    def _finish_activity(self, *, success: bool = True) -> None:
-        if self._activity_busy:
-            self._log_progress.stop()
-            self._log_progress.configure(mode="determinate")
-            self._activity_busy = False
-        self._log_progress["value"] = 100 if success else 0
-        self._log_pct_var.set("100%" if success else "")
-        self._activity_var.set("Ready" if success else "Setup needs attention")
+state = LauncherState()
 
-    def _set_log_progress(self, pct: float, text: str = "", detail: str = "") -> None:
-        if self._activity_busy:
-            self._log_progress.stop()
-            self._log_progress.configure(mode="determinate")
-            self._activity_busy = False
-        pct = max(0.0, min(100.0, pct))
-        self._log_progress["value"] = pct
-        self._log_pct_var.set(f"{int(pct)}%")
-        shown = detail or text
+
+def _license_color(status: LicenseStatus) -> str:
+    if not status.ok:
+        return "red"
+    if status.expires == "dev":
+        return "green"
+    days = status.remaining_days if status.remaining_days is not None else 999
+    if days <= 0:
+        return "red"
+    if days <= 7:
+        return "orange"
+    return "green"
+
+
+def _append_log_line(text: str, level: str) -> None:
+    state.log_lines.append((level, text))
+    if len(state.log_lines) > MAX_LOG_LINES:
+        state.log_lines = state.log_lines[-MAX_LOG_LINES:]
+
+
+def _apply_log_event(event: LogEvent) -> None:
+    if event.progress is not None:
+        state.progress_indeterminate = False
+        state.progress_pct = max(0.0, min(100.0, event.progress))
+        shown = event.progress_detail or event.progress_text or event.text
         if shown:
-            self._log_detail_var.set(shown)
-            self._activity_var.set(shown if len(shown) <= 72 else shown[:69] + "…")
-            step = int(pct // 10) * 10
-            if step > self._last_progress_log_pct or pct >= 100:
-                self._last_progress_log_pct = step
-                self.log_box.configure(state="normal")
-                self.log_box.insert(tk.END, shown + "\n", ("dim",))
-                self.log_box.see(tk.END)
-                self.log_box.configure(state="disabled")
+            state.progress_detail = shown
+            state.activity_text = shown if len(shown) <= 80 else shown[:77] + "…"
+            step = int(state.progress_pct // 10) * 10
+            if step > state.last_progress_log_pct or state.progress_pct >= 100:
+                state.last_progress_log_pct = step
+                _append_log_line(shown, "dim")
+    elif event.level == "title":
+        lower = event.text.lower()
+        if "started" in lower:
+            state.progress_indeterminate = True
+            state.activity_text = event.text
+        elif "finished" in lower or "complete" in lower:
+            state.progress_indeterminate = False
+            state.progress_pct = 100.0
+            state.activity_text = "Ready"
+    elif event.level in ("warn", "cmd", "info", "ok", "err") and state.progress_indeterminate:
+        short = event.text if len(event.text) <= 80 else event.text[:77] + "…"
+        if short and not short.startswith("$ "):
+            state.activity_text = short
 
-    def _apply_log_event(self, event: LogEvent) -> None:
-        if event.progress is not None:
-            self._set_log_progress(
-                event.progress,
-                event.progress_text or event.text,
-                event.progress_detail,
-            )
-        elif event.level == "title":
-            lower = event.text.lower()
-            if "started" in lower:
-                self._begin_activity(event.text)
-            elif "finished" in lower or "complete" in lower:
-                self._finish_activity(success=True)
-        elif event.level in ("warn", "cmd", "info", "ok", "err") and self._activity_busy:
-            short = event.text if len(event.text) <= 72 else event.text[:69] + "…"
-            if not short.startswith("$ "):
-                self._activity_var.set(short)
+    if event.text:
+        _append_log_line(event.text, event.level)
 
-        if not event.text:
-            return
 
-        self.log_box.configure(state="normal")
-        self.log_box.insert(tk.END, event.text + "\n", (event.level,))
-        self._log_line_count += 1
-        if self._log_line_count > MAX_LOG_LINES:
-            self.log_box.delete("1.0", f"{self._log_line_count - MAX_LOG_LINES}.0")
-            self._log_line_count = MAX_LOG_LINES
-        self.log_box.see(tk.END)
-        self.log_box.configure(state="disabled")
+def build_ui() -> None:
+    from nicegui import ui
 
-    def _poll_log(self) -> None:
-        batch = 0
-        while batch < 40:
-            try:
-                event = self.log_queue.get_nowait()
-            except queue.Empty:
-                break
-            self._apply_log_event(event)
-            batch += 1
-        self.root.after(150, self._poll_log)
+    ui.dark_mode().enable()
+    ui.add_head_html(
+        """
+        <style>
+          body { background: #0f1117 !important; }
+          .studio-page { max-width: 920px; margin: 0 auto; }
+          .studio-card {
+            background: #1a1d2e !important;
+            border: 1px solid #30363d;
+            border-radius: 12px;
+            transition: box-shadow 0.25s ease, transform 0.2s ease;
+          }
+          .studio-card:hover { box-shadow: 0 4px 24px rgba(0,0,0,0.35); }
+          .log-line { font-family: Consolas, monospace; font-size: 0.82rem; line-height: 1.45; }
+          .nicegui-content { padding: 0 !important; }
+        </style>
+        """
+    )
 
-    def _poll_server_status(self) -> None:
-        up = self.manager.running or (_port_open(8000) and _port_open(3000))
-        self.status_var.set("Status: Running" if up else "Status: Stopped")
-        if up != self._servers_up:
-            self._servers_up = up
-            self.refresh_checks_async()
-        self.root.after(3000, self._poll_server_status)
+    # --- dialogs ---
+    license_dialog = ui.dialog().props("persistent")
+    machine_id = get_machine_id()
 
-    def _wait_and_refresh_checks(self) -> None:
-        """Wait until API + UI ports are open, then refresh the requirements grid."""
-
-        def work() -> None:
-            self._enqueue_log("Waiting for API and UI to be ready…")
-            ready = wait_for_servers(timeout_sec=120)
-            if ready:
-                self._enqueue_log("Servers are up.")
-            else:
-                self._enqueue_log("Servers still starting — checks will update when ready.")
-            self._servers_up = _port_open(8000) and _port_open(3000)
-            self.root.after(0, self.refresh_checks_async)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _poll_access_status(self) -> None:
-        self._refresh_license_panel()
-        self.root.after(60000, self._poll_access_status)
-
-    def _license_status_color(self, status: LicenseStatus) -> str:
-        if not status.ok:
-            return ERR
-        if status.expires == "dev":
-            return OK
-        days = status.remaining_days if status.remaining_days is not None else 999
-        if days <= 0:
-            return ERR
-        if days <= 7:
-            return WARN
-        return OK
-
-    def _refresh_license_panel(self) -> None:
-        status = current_license_status()
-        color = self._license_status_color(status)
-
-        if status.ok:
-            self.license_state_var.set("Active")
-            self.license_state_label.configure(fg=color)
-            remaining = status.remaining_label or "—"
-            self.license_remaining_var.set(remaining)
-            self.license_remaining_label.configure(fg=color)
-            self.license_expires_var.set(f"Expires {status.expires or '—'}")
-            if status.source:
-                self.license_type_var.set(f"Type: {status.source}")
-            else:
-                self.license_type_var.set("")
-            if status.remaining_days is not None and status.expires != "dev":
-                pct = min(100, max(0, int((status.remaining_days / 365) * 100)))
-                self.license_progress["value"] = pct
-                self.license_progress.pack(fill="x", pady=(6, 0))
-            else:
-                self.license_progress.pack_forget()
-        else:
-            self.license_state_var.set("Not activated")
-            self.license_state_label.configure(fg=ERR)
-            self.license_remaining_var.set(LICENSE_CONTACT_HINT)
-            self.license_remaining_label.configure(fg=MUTED)
-            self.license_expires_var.set("Enter a license to use Open UI / Start Studio")
-            self.license_type_var.set("")
-            self.license_progress.pack_forget()
-
-        if hasattr(self, "access_var"):
-            self.access_var.set(status.message if status.ok else "")
-
-    def _open_license_contact(self) -> None:
-        webbrowser.open(LICENSE_CONTACT_URL)
-
-    def _show_activation_success(self, result: LicenseStatus) -> None:
-        remaining = result.remaining_label or "—"
-        kind = (result.source or "offline").capitalize()
-        messagebox.showinfo(
-            "License activated",
-            f"Your license is now active.\n\n"
-            f"Time remaining: {remaining}\n"
-            f"Expiry date: {result.expires or '—'}\n"
-            f"License type: {kind}\n\n"
-            "You can click Open UI or Start Studio.",
+    with license_dialog, ui.card().classes("w-[520px] studio-card"):
+        ui.label("Activate your license").classes("text-h6")
+        ui.label(f"Need a license? {LICENSE_CONTACT_HINT}").classes("text-caption text-grey")
+        ui.button("Open Telegram", on_click=lambda: webbrowser.open(LICENSE_CONTACT_URL)).props(
+            "flat color=primary"
         )
-
-    def _set_window_icon(self) -> None:
-        try:
-            if sys.platform == "win32" and ICON_ICO.is_file():
-                self.root.iconbitmap(default=str(ICON_ICO))
-            elif ICON_PNG.is_file():
-                self._window_icon = tk.PhotoImage(file=str(ICON_PNG))
-                self.root.iconphoto(True, self._window_icon)
-        except Exception:
-            pass
-
-    def _load_header_logo(self) -> tk.PhotoImage | None:
-        for path in (LOGO_HEADER, ICON_PNG):
-            if not path.is_file():
-                continue
-            try:
-                return tk.PhotoImage(file=str(path))
-            except Exception:
-                continue
-        return None
-
-    def _show_license_dialog(self, note: str = "") -> None:
-        win = tk.Toplevel(self.root)
-        win.title("Activate license")
-        win.configure(bg=BG)
-        win.geometry("540x460")
-        win.transient(self.root)
-        win.grab_set()
-
-        tk.Label(
-            win,
-            text="Activate your license",
-            font=("Segoe UI", 15, "bold"),
-            fg=TEXT,
-            bg=BG,
-        ).pack(anchor="w", padx=16, pady=(14, 4))
-
-        contact = tk.Frame(win, bg=PANEL)
-        contact.pack(fill="x", padx=16, pady=(0, 8))
-        tk.Label(
-            contact,
-            text="Need a license?",
-            font=("Segoe UI", 9, "bold"),
-            fg=TEXT,
-            bg=PANEL,
-        ).pack(anchor="w", padx=12, pady=(10, 2))
-        tk.Label(
-            contact,
-            text=f"{LICENSE_CONTACT_HINT}\n{LICENSE_CONTACT_LABEL}",
-            font=("Segoe UI", 9),
-            fg=MUTED,
-            bg=PANEL,
-            justify="left",
-        ).pack(anchor="w", padx=12, pady=(0, 8))
-        ttk.Button(contact, text="Open Telegram", command=self._open_license_contact).pack(
-            anchor="w", padx=12, pady=(0, 10)
+        ui.input("Machine ID", value=machine_id).props("readonly outlined dense").classes("w-full")
+        ui.button(
+            "Copy Machine ID",
+            on_click=lambda: ui.run_javascript(
+                f"navigator.clipboard.writeText('{machine_id}')"
+            ),
+        ).props("outline dense")
+        key_input = ui.input("License key (VCPM-... or VCPM2...)").props("outlined dense").classes(
+            "w-full"
         )
-
-        if note:
-            tk.Label(
-                win,
-                text=note,
-                font=("Segoe UI", 9),
-                fg=WARN,
-                bg=BG,
-                wraplength=500,
-                justify="left",
-            ).pack(anchor="w", padx=16, pady=(0, 8))
-
-        panel = tk.Frame(win, bg=PANEL)
-        panel.pack(fill="both", expand=True, padx=16, pady=8)
-
-        mid_var = tk.StringVar(value=get_machine_id())
-        tk.Label(panel, text="Your Machine ID (send to author):", fg=MUTED, bg=PANEL, font=("Segoe UI", 9)).pack(
-            anchor="w", padx=12, pady=(12, 2)
-        )
-        row = tk.Frame(panel, bg=PANEL)
-        row.pack(fill="x", padx=12)
-        tk.Entry(
-            row,
-            textvariable=mid_var,
-            font=("Consolas", 9),
-            state="readonly",
-            readonlybackground="#0d1117",
-            fg=TEXT,
-            relief="flat",
-        ).pack(side="left", fill="x", expand=True, ipady=4)
-
-        def copy_mid() -> None:
-            win.clipboard_clear()
-            win.clipboard_append(mid_var.get())
-            status_var.set("Machine ID copied.")
-
-        ttk.Button(row, text="Copy", command=copy_mid).pack(side="left", padx=(8, 0))
-
-        tk.Label(
-            panel,
-            text="License key (VCPM-.... online  or  VCPM2.... offline):",
-            fg=MUTED,
-            bg=PANEL,
-            font=("Segoe UI", 9),
-        ).pack(anchor="w", padx=12, pady=(12, 2))
-        key_entry = tk.Entry(panel, font=("Consolas", 9), bg="#0d1117", fg=TEXT, relief="flat")
-        key_entry.pack(fill="x", padx=12, ipady=6)
-        key_entry.focus_set()
-        status_var = tk.StringVar()
-        tk.Label(panel, textvariable=status_var, fg=MUTED, bg=PANEL, font=("Segoe UI", 9), wraplength=480).pack(
-            anchor="w", padx=12, pady=8
-        )
+        status_lbl = ui.label("").classes("text-caption")
 
         def activate() -> None:
-            status_var.set("Checking license…")
-            key = key_entry.get().strip()
+            key = (key_input.value or "").strip()
             if not key:
-                status_var.set("Paste your license key first.")
+                status_lbl.text = "Paste your license key first."
                 return
+            status_lbl.text = "Checking license…"
 
             def work() -> None:
                 try:
@@ -392,270 +216,396 @@ class StudioLauncherApp:
                     result = LicenseStatus(False, str(exc))
 
                 def done() -> None:
-                    status_var.set(result.message)
+                    status_lbl.text = result.message
                     if result.ok:
-                        self._refresh_license_panel()
-                        self._enqueue_log(result.message)
-                        win.destroy()
-                        self._show_activation_success(result)
+                        state.enqueue_log(result.message)
+                        license_dialog.close()
+                        license_panel.refresh()
+                        ui.notify(
+                            f"License active — {result.remaining_label or ''}",
+                            type="positive",
+                        )
 
-                win.after(0, done)
+                ui.timer(0.01, done, once=True)
 
             threading.Thread(target=work, daemon=True).start()
 
-        btn_row = tk.Frame(panel, bg=PANEL)
-        btn_row.pack(anchor="w", padx=12, pady=(0, 12))
-        ttk.Button(btn_row, text="Activate license", command=activate).pack(side="left")
-        ttk.Button(btn_row, text="Cancel", command=win.destroy).pack(side="left", padx=(8, 0))
-        center_tk_window(win, width=540, height=460, parent=self.root)
+        with ui.row().classes("w-full justify-end gap-2"):
+            ui.button("Cancel", on_click=license_dialog.close).props("flat")
+            ui.button("Activate license", on_click=activate).props("unelevated color=primary")
 
-    def _ensure_licensed(self) -> bool:
-        status = current_license_status()
-        self._refresh_license_panel()
-        if status.ok:
+    update_dialog = ui.dialog()
+    update_ui: dict = {}
+
+    with update_dialog, ui.card().classes("w-[480px] studio-card"):
+        update_ui["title"] = ui.label().classes("text-h6")
+        update_ui["body"] = ui.label().classes("text-body2")
+
+        def apply_git() -> None:
+            update_dialog.close()
+            run_git_update()
+
+        def open_zip() -> None:
+            if state.update_status:
+                webbrowser.open(state.update_status.zip_url)
+            update_dialog.close()
+            ui.notify("Download ZIP and replace folder (keep data/license.json)", type="info")
+
+        with ui.row().classes("w-full justify-end gap-2"):
+            ui.button("Later", on_click=update_dialog.close).props("flat")
+            update_ui["git_btn"] = ui.button(
+                "Git pull", on_click=apply_git
+            ).props("unelevated color=primary")
+            ui.button("Download ZIP", on_click=open_zip).props("outline")
+
+    # --- header ---
+    with ui.column().classes("studio-page w-full gap-4 p-4"):
+        with ui.row().classes("items-center gap-4 w-full"):
+            if LOGO_HEADER.is_file():
+                ui.image(str(LOGO_HEADER)).classes("h-14")
+            elif ICON_PNG.is_file():
+                ui.image(str(ICON_PNG)).classes("h-14")
+            with ui.column().classes("gap-0"):
+                ui.label(STUDIO_NAME).classes("text-h5 font-bold")
+                ui.label("Voice studio · setup runs quietly in the background").classes(
+                    "text-caption text-grey"
+                )
+
+        @ui.refreshable
+        def license_panel() -> None:
+            status = current_license_status()
+            color = _license_color(status)
+            with ui.card().classes("studio-card w-full"):
+                with ui.row().classes("w-full items-start justify-between"):
+                    with ui.column().classes("gap-1"):
+                        ui.label(
+                            "Active" if status.ok else "Not activated",
+                        ).classes(f"text-h6 text-{color}")
+                        if status.ok:
+                            ui.label(status.remaining_label or "—").classes(
+                                f"text-h5 text-{color}"
+                            )
+                            ui.label(f"Expires {status.expires or '—'}").classes("text-caption")
+                            if status.source:
+                                ui.label(f"Type: {status.source}").classes("text-caption text-grey")
+                        else:
+                            ui.label(LICENSE_CONTACT_HINT).classes("text-body2")
+                            ui.label("Enter a license to use Open UI / Start Studio").classes(
+                                "text-caption text-grey"
+                            )
+                    ui.button("Enter license", on_click=license_dialog.open).props(
+                        "outline color=primary"
+                    )
+                if status.ok and status.remaining_days is not None and status.expires != "dev":
+                    ui.linear_progress(
+                        value=min(1.0, max(0.0, status.remaining_days / 365)),
+                        show_value=False,
+                    ).props(f'color="{color}"').classes("rounded")
+
+        license_panel()
+
+        with ui.card().classes("studio-card w-full"):
+            ui.label("Requirements").classes("text-subtitle1 font-medium mb-2")
+            checks_container = ui.row().classes("w-full gap-4 flex-wrap")
+
+            @ui.refreshable
+            def checks_panel() -> None:
+                checks_container.clear()
+                with checks_container:
+                    for item in state.checks_cache:
+                        if item.ok:
+                            icon, chip_color = "check_circle", "green"
+                        elif not item.required:
+                            icon, chip_color = "warning", "orange"
+                        else:
+                            icon, chip_color = "cancel", "red"
+                        with ui.column().classes("gap-0 min-w-[200px]"):
+                            with ui.row().classes("items-center gap-1"):
+                                ui.icon(icon, color=chip_color).classes("text-sm")
+                                ui.label(item.label).classes("text-body2 font-medium")
+                            ui.label(item.detail).classes("text-caption text-grey pl-6")
+
+            checks_panel()
+
+        with ui.row().classes("gap-2 flex-wrap"):
+            ui.button("Refresh checks", icon="refresh", on_click=lambda: refresh_checks()).props(
+                "outline"
+            )
+            setup_btn = ui.button("Run setup", icon="build", on_click=lambda: run_setup()).props(
+                "unelevated color=primary"
+            )
+            ui.button("Enter license", icon="vpn_key", on_click=license_dialog.open).props("outline")
+            ui.button(
+                "Get a license",
+                icon="chat",
+                on_click=lambda: webbrowser.open(LICENSE_CONTACT_URL),
+            ).props("flat")
+            ui.button(
+                "Check for updates",
+                icon="system_update",
+                on_click=lambda: check_updates(manual=True),
+            ).props("outline")
+
+        with ui.card().classes("studio-card w-full"):
+            with ui.row().classes("w-full items-center justify-between"):
+                server_status = ui.label("Status: Stopped").classes("text-subtitle1 font-bold")
+                with ui.row().classes("gap-2"):
+                    ui.button("Open UI", icon="open_in_browser", on_click=open_ui).props(
+                        "unelevated color=primary"
+                    )
+                    ui.button("Stop", icon="stop", on_click=stop_servers).props("outline color=negative")
+                    ui.button("Start Studio", icon="play_arrow", on_click=start_studio).props(
+                        "unelevated color=positive"
+                    )
+
+        with ui.expansion("Activity log", icon="terminal", value=True).classes(
+            "studio-card w-full"
+        ) as log_expansion:
+            activity_label = ui.label("Idle").classes("text-body2 font-medium")
+            progress_bar = ui.linear_progress(value=0, show_value=False).props("color=positive")
+            progress_pct_label = ui.label("").classes("text-caption text-positive")
+            progress_detail_label = ui.label("").classes("text-caption text-grey log-line")
+
+            with ui.row().classes("w-full justify-end"):
+                ui.button("Clear log", icon="delete_outline", on_click=clear_log).props(
+                    "flat dense"
+                )
+
+            log_scroll = ui.scroll_area().classes("w-full h-56 bg-[#0d1117] rounded-lg p-2")
+            with log_scroll:
+                log_column = ui.column().classes("w-full gap-0")
+
+        with ui.row().classes("w-full justify-between items-center text-caption text-grey"):
+            ui.label(f"License support: {LICENSE_CONTACT_LABEL}")
+            with ui.row().classes("gap-3 items-center"):
+                update_label = ui.label("")
+                version_label = ui.label(f"v{get_studio_release_version()}")
+
+    # --- UI update helpers ---
+    def rebuild_log_view() -> None:
+        log_column.clear()
+        with log_column:
+            for level, text in state.log_lines:
+                style = LOG_STYLE.get(level, LOG_STYLE["info"])
+                ui.html(f'<div class="log-line" style="{style}">{_escape_html(text)}</div>')
+
+    def sync_progress_ui() -> None:
+        activity_label.text = state.activity_text
+        progress_detail_label.text = state.progress_detail
+        if state.progress_indeterminate:
+            progress_bar.props('indeterminate')
+        else:
+            progress_bar.props(remove='indeterminate')
+            progress_bar.value = state.progress_pct / 100.0
+            progress_pct_label.text = f"{int(state.progress_pct)}%" if state.progress_pct else ""
+
+    def poll_log() -> None:
+        changed = False
+        batch = 0
+        while batch < 40:
+            try:
+                event = state.log_queue.get_nowait()
+            except queue.Empty:
+                break
+            _apply_log_event(event)
+            changed = True
+            batch += 1
+        if changed:
+            rebuild_log_view()
+            sync_progress_ui()
+
+    def poll_servers() -> None:
+        up = state.manager.running or (_port_open(8000) and _port_open(3000))
+        server_status.text = "Status: Running" if up else "Status: Stopped"
+        if up != state.servers_up:
+            state.servers_up = up
+            refresh_checks()
+
+    def poll_license() -> None:
+        license_panel.refresh()
+
+    def refresh_checks() -> None:
+        if state.checks_busy:
+            return
+        state.checks_busy = True
+
+        def work() -> None:
+            checks = run_checks()
+
+            def done() -> None:
+                state.checks_cache = checks
+                checks_panel.refresh()
+                state.checks_busy = False
+
+            ui.timer(0.01, done, once=True)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def clear_log() -> None:
+        state.log_lines.clear()
+        state.last_progress_log_pct = -1
+        rebuild_log_view()
+
+    def set_setup_busy(busy: bool) -> None:
+        state.setup_busy = busy
+        if busy:
+            setup_btn.disable()
+        else:
+            setup_btn.enable()
+
+    def auto_setup() -> None:
+        state.activity_text = "Checking install requirements…"
+        state.progress_indeterminate = True
+        sync_progress_ui()
+        state.enqueue_log("Checking install requirements (no license needed for setup)…")
+        success = True
+        try:
+            success = bootstrap_setup(state.manager)
+        except Exception as exc:
+            state.enqueue_log(f"Setup error: {exc}")
+            success = False
+        finally:
+            state.progress_indeterminate = False
+            state.progress_pct = 100.0 if success else 0.0
+            state.activity_text = "Ready" if success else "Setup needs attention"
+            ui.timer(0.01, lambda: (sync_progress_ui(), refresh_checks()), once=True)
+
+    def run_setup() -> None:
+        if state.setup_busy:
+            return
+        state.last_progress_log_pct = -1
+        state.enqueue_log("Running setup…")
+        state.activity_text = "Running setup…"
+        state.progress_indeterminate = True
+        set_setup_busy(True)
+        sync_progress_ui()
+        log_expansion.value = True
+
+        def work() -> None:
+            try:
+                ok = state.manager.setup()
+                if not ok:
+                    state.activity_text = "Setup needs attention"
+                    state.progress_pct = 0.0
+            except Exception as exc:
+                state.enqueue_log(f"Error: {exc}")
+                state.activity_text = "Setup needs attention"
+            finally:
+                state.progress_indeterminate = False
+                ui.timer(
+                    0.01,
+                    lambda: (set_setup_busy(False), sync_progress_ui(), refresh_checks()),
+                    once=True,
+                )
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def ensure_licensed() -> bool:
+        license_panel.refresh()
+        if current_license_status().ok:
             return True
-        self._show_license_dialog(status.message)
+        license_dialog.open()
         return current_license_status().ok
 
-    def _build_main_ui(self) -> None:
-        header = tk.Frame(self.root, bg=BG)
-        header.pack(fill="x", padx=16, pady=(16, 8))
+    def start_studio() -> None:
+        if not ensure_licensed():
+            return
 
-        title_row = tk.Frame(header, bg=BG)
-        title_row.pack(anchor="w")
+        def work() -> None:
+            checks = run_checks()
+            ready = all(c.ok for c in checks if c.required and c.key != "servers")
+            if not ready:
+                ui.timer(
+                    0.01,
+                    lambda: ui.notify("Some requirements are missing — run Setup first.", type="warning"),
+                    once=True,
+                )
+                return
+            state.manager.start(open_browser=True)
+            ui.timer(0.01, wait_and_refresh, once=True)
 
-        self._header_logo = self._load_header_logo()
-        if self._header_logo is not None:
-            tk.Label(title_row, image=self._header_logo, bg=BG).pack(side="left", padx=(0, 12))
+        threading.Thread(target=work, daemon=True).start()
 
-        title_text = tk.Frame(title_row, bg=BG)
-        title_text.pack(side="left")
-        tk.Label(
-            title_text,
-            text=STUDIO_NAME,
-            font=("Segoe UI", 18, "bold"),
-            fg=TEXT,
-            bg=BG,
-        ).pack(anchor="w")
-        tk.Label(
-            title_text,
-            text="Voice studio · setup runs quietly in the background",
-            font=("Segoe UI", 10),
-            fg=MUTED,
-            bg=BG,
-        ).pack(anchor="w")
+    def stop_servers() -> None:
+        threading.Thread(target=state.manager.stop, daemon=True).start()
+        ui.timer(0.5, refresh_checks, once=True)
 
-        self.access_var = tk.StringVar()
-        self._build_license_panel()
+    def open_ui() -> None:
+        if not ensure_licensed():
+            return
 
-        req_frame = tk.LabelFrame(
-            self.root,
-            text=" Requirements ",
-            font=("Segoe UI", 10, "bold"),
-            fg=TEXT,
-            bg=PANEL,
-            labelanchor="n",
-        )
-        req_frame.pack(fill="x", padx=16, pady=8)
+        def work() -> None:
+            if not state.manager.running and not (_port_open(8000) and _port_open(3000)):
+                checks = run_checks()
+                ready = all(c.ok for c in checks if c.required and c.key != "servers")
+                if not ready:
+                    ui.timer(
+                        0.01,
+                        lambda: ui.notify("Finish setup first, then open the UI.", type="warning"),
+                        once=True,
+                    )
+                    return
+                if not state.manager.start(open_browser=False):
+                    return
+                ui.timer(0.01, wait_and_refresh, once=True)
+            webbrowser.open("http://localhost:3000/home")
 
-        self.req_grid = tk.Frame(req_frame, bg=PANEL)
-        self.req_grid.pack(fill="x", padx=12, pady=10)
+        threading.Thread(target=work, daemon=True).start()
 
-        btn_row = tk.Frame(self.root, bg=BG)
-        btn_row.pack(fill="x", padx=16, pady=4)
+    def wait_and_refresh() -> None:
+        def work() -> None:
+            state.enqueue_log("Waiting for API and UI to be ready…")
+            ready = wait_for_servers(timeout_sec=120)
+            state.enqueue_log("Servers are up." if ready else "Servers still starting…")
+            ui.timer(0.01, refresh_checks, once=True)
 
-        ttk.Button(btn_row, text="Refresh checks", command=self.refresh_checks_async).pack(
-            side="left", padx=(0, 8)
-        )
-        self.setup_btn = ttk.Button(btn_row, text="Run setup", command=self._run_setup)
-        self.setup_btn.pack(side="left", padx=(0, 8))
-        ttk.Button(btn_row, text="Enter license", command=lambda: self._show_license_dialog()).pack(
-            side="left", padx=(0, 8)
-        )
-        ttk.Button(btn_row, text="Get a license", command=self._open_license_contact).pack(side="left")
-        ttk.Button(btn_row, text="Check for updates", command=lambda: self._check_updates(manual=True)).pack(
-            side="left", padx=(8, 0)
-        )
+        threading.Thread(target=work, daemon=True).start()
 
-        srv_row = tk.Frame(self.root, bg=BG)
-        srv_row.pack(fill="x", padx=16, pady=8)
-
-        self.status_var = tk.StringVar(value="Status: Stopped")
-        tk.Label(
-            srv_row,
-            textvariable=self.status_var,
-            font=("Segoe UI", 11, "bold"),
-            fg=TEXT,
-            bg=BG,
-        ).pack(side="left")
-
-        ttk.Button(srv_row, text="Start Studio", command=self._start).pack(side="right", padx=(8, 0))
-        ttk.Button(srv_row, text="Stop", command=self._stop).pack(side="right", padx=(8, 0))
-        ttk.Button(srv_row, text="Open UI", command=self._open_ui).pack(side="right")
-
-        log_toggle_row = tk.Frame(self.root, bg=BG)
-        log_toggle_row.pack(fill="x", padx=16, pady=(4, 0))
-        self.log_toggle_btn = ttk.Button(log_toggle_row, text="Show activity log", command=self._toggle_log)
-        self.log_toggle_btn.pack(side="left")
-        tk.Label(
-            log_toggle_row,
-            text="Setup progress, downloads, and server messages",
-            font=("Segoe UI", 9),
-            fg=MUTED,
-            bg=BG,
-        ).pack(side="left", padx=(10, 0))
-
-        self.log_frame = tk.LabelFrame(
-            self.root,
-            text=" Activity log ",
-            font=("Segoe UI", 10, "bold"),
-            fg=TEXT,
-            bg=PANEL,
-            labelanchor="n",
-            highlightbackground="#30363d",
-            highlightthickness=1,
-        )
-        # Hidden by default; auto-opens during setup.
-
-        log_header = tk.Frame(self.log_frame, bg=PANEL)
-        log_header.pack(fill="x", padx=10, pady=(10, 4))
-
-        tk.Label(
-            log_header,
-            text="Current task",
-            font=("Segoe UI", 8),
-            fg=MUTED,
-            bg=PANEL,
-        ).pack(anchor="w")
-        self._activity_var = tk.StringVar(value="Idle")
-        tk.Label(
-            log_header,
-            textvariable=self._activity_var,
-            font=("Segoe UI", 10, "bold"),
-            fg=TEXT,
-            bg=PANEL,
-            anchor="w",
-        ).pack(fill="x", pady=(2, 0))
-
-        progress_row = tk.Frame(self.log_frame, bg=PANEL)
-        progress_row.pack(fill="x", padx=10, pady=(0, 6))
-
-        style = ttk.Style(self.root)
-        style.configure(
-            "Studio.Horizontal.TProgressbar",
-            troughcolor="#0d1117",
-            background=OK,
-            darkcolor=OK,
-            lightcolor=OK,
-            bordercolor=PANEL,
-            thickness=10,
-        )
-        self._log_progress = ttk.Progressbar(
-            progress_row,
-            maximum=100,
-            mode="determinate",
-            style="Studio.Horizontal.TProgressbar",
-        )
-        self._log_progress.pack(side="left", fill="x", expand=True)
-        self._log_pct_var = tk.StringVar(value="")
-        tk.Label(
-            progress_row,
-            textvariable=self._log_pct_var,
-            font=("Consolas", 9, "bold"),
-            fg=OK,
-            bg=PANEL,
-            width=5,
-        ).pack(side="right", padx=(8, 0))
-
-        self._log_detail_var = tk.StringVar(value="")
-        tk.Label(
-            self.log_frame,
-            textvariable=self._log_detail_var,
-            font=("Consolas", 9),
-            fg=MUTED,
-            bg=PANEL,
-            anchor="w",
-        ).pack(fill="x", padx=10, pady=(0, 4))
-
-        log_toolbar = tk.Frame(self.log_frame, bg=PANEL)
-        log_toolbar.pack(fill="x", padx=10, pady=(0, 4))
-        ttk.Button(log_toolbar, text="Clear log", command=self._clear_log).pack(side="right")
-
-        log_colors = {
-            "info": TEXT,
-            "ok": OK,
-            "warn": WARN,
-            "err": ERR,
-            "cmd": "#79c0ff",
-            "dim": MUTED,
-            "title": "#a371f7",
-        }
-        self.log_box = scrolledtext.ScrolledText(
-            self.log_frame,
-            height=12,
-            font=("Consolas", 9),
-            bg="#0d1117",
-            fg=TEXT,
-            insertbackground=TEXT,
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground="#21262d",
-            highlightcolor="#21262d",
-            state="disabled",
-            wrap="word",
-        )
-        for tag, color in log_colors.items():
-            font = ("Consolas", 9, "bold") if tag == "title" else ("Consolas", 9)
-            self.log_box.tag_configure(tag, foreground=color, font=font)
-        self.log_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-
-        foot = tk.Frame(self.root, bg=BG)
-        foot.pack(fill="x", padx=16, pady=(8, 10))
-        self._version_var = tk.StringVar(value=f"v{get_studio_release_version()}")
-        tk.Label(
-            foot,
-            textvariable=self._version_var,
-            font=("Segoe UI", 9),
-            fg=MUTED,
-            bg=BG,
-        ).pack(side="right")
-        self._update_var = tk.StringVar(value="")
-        tk.Label(
-            foot,
-            textvariable=self._update_var,
-            font=("Segoe UI", 9),
-            fg=WARN,
-            bg=BG,
-        ).pack(side="right", padx=(0, 12))
-        tk.Label(
-            foot,
-            text=f"License support: {LICENSE_CONTACT_LABEL}",
-            font=("Segoe UI", 9),
-            fg=MUTED,
-            bg=BG,
-        ).pack(side="left")
-        tk.Label(
-            foot,
-            text="Open Telegram",
-            font=("Segoe UI", 9, "underline"),
-            fg=OK,
-            bg=BG,
-            cursor="hand2",
-        ).pack(side="left", padx=(8, 0))
-        foot.winfo_children()[-1].bind("<Button-1>", lambda _e: self._open_license_contact())
-
-    def _refresh_version_label(self) -> None:
-        self._version_var.set(f"v{get_studio_release_version()}")
-
-    def _set_update_status(self, status: UpdateStatus) -> None:
-        self._update_status = status
+    def set_update_ui(status: UpdateStatus) -> None:
+        state.update_status = status
         if status.update_available:
-            self._update_var.set(f"Update available: v{status.latest}")
+            update_label.text = f"Update available: v{status.latest}"
         else:
-            self._update_var.set("")
+            update_label.text = ""
+        version_label.text = f"v{get_studio_release_version()}"
 
-    def _check_updates_quiet(self) -> None:
-        if self._update_snoozed:
+    def show_update_dialog(status: UpdateStatus) -> None:
+        set_update_ui(status)
+        update_ui["title"].text = f"Update available — v{status.latest}"
+        update_ui["body"].text = (
+            f"You have v{status.current}. "
+            + ("Git pull is available." if status.can_git_update else "Download the ZIP from GitHub.")
+        )
+        update_ui["git_btn"].set_visibility(status.can_git_update)
+        update_dialog.open()
+
+    def check_updates(*, manual: bool) -> None:
+        state.enqueue_log("Checking for updates…")
+
+        def work() -> None:
+            status = check_for_updates()
+
+            def done() -> None:
+                set_update_ui(status)
+                if status.error:
+                    state.enqueue_log(f"Update check failed: {status.error}")
+                    if manual:
+                        ui.notify(status.error, type="negative")
+                    return
+                if not status.update_available:
+                    state.enqueue_log(f"Up to date (v{status.current}).")
+                    if manual:
+                        ui.notify(f"Up to date (v{status.current})", type="positive")
+                    return
+                state.enqueue_log(f"Update available: v{status.latest} (you have v{status.current}).")
+                show_update_dialog(status)
+
+            ui.timer(0.01, done, once=True)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def check_updates_quiet() -> None:
+        if state.update_snoozed:
             return
 
         def work() -> None:
@@ -663,343 +613,81 @@ class StudioLauncherApp:
                 status = check_for_updates()
             except Exception:
                 return
+            if not status.update_available:
+                return
 
             def notify() -> None:
-                self._set_update_status(status)
-                if not status.update_available:
-                    return
-                if messagebox.askyesno(
-                    "Update available",
-                    f"Version {status.latest} is available (you have {status.current}).\n\n"
-                    "Open the update options now?",
-                ):
-                    self._show_update_dialog(status)
+                set_update_ui(status)
+                show_update_dialog(status)
 
-            self.root.after(0, notify)
+            ui.timer(0.01, notify, once=True)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _check_updates(self, *, manual: bool) -> None:
-        self._enqueue_log("Checking for updates…")
+    def run_git_update() -> None:
+        state.enqueue_log("Applying update…")
 
         def work() -> None:
-            status = check_for_updates()
+            ok, msg = apply_git_update(state.enqueue_log)
 
             def done() -> None:
-                self._set_update_status(status)
-                if status.error:
-                    self._enqueue_log(f"Update check failed: {status.error}")
-                    if manual:
-                        messagebox.showwarning(
-                            "Update check failed",
-                            f"Could not reach GitHub.\n\n{status.error}",
-                        )
-                    return
-                if not status.update_available:
-                    self._enqueue_log(f"Up to date (v{status.current}).")
-                    if manual:
-                        messagebox.showinfo("Up to date", f"You have the latest version (v{status.current}).")
-                    return
-                self._enqueue_log(f"Update available: v{status.latest} (you have v{status.current}).")
-                self._show_update_dialog(status)
-
-            self.root.after(0, done)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _show_update_dialog(self, status: UpdateStatus) -> None:
-        if status.can_git_update:
-            choice = messagebox.askyesnocancel(
-                "Update available",
-                f"Version {status.latest} is available (you have {status.current}).\n\n"
-                "Yes = Update now (git pull)\n"
-                "No = Open download page (ZIP install)\n"
-                "Cancel = Later",
-            )
-            if choice is True:
-                self._run_git_update()
-            elif choice is False:
-                import webbrowser
-
-                webbrowser.open(status.zip_url)
-                messagebox.showinfo(
-                    "Download update",
-                    "Download the ZIP, extract it, and replace your app folder.\n\n"
-                    "Keep your data\\license.json file if you want to keep the same license.",
-                )
-            else:
-                self._update_snoozed = True
-            return
-
-        if messagebox.askyesno(
-            "Update available",
-            f"Version {status.latest} is available (you have {status.current}).\n\n"
-            "Open the download page?",
-        ):
-            import webbrowser
-
-            webbrowser.open(status.zip_url)
-            messagebox.showinfo(
-                "Download update",
-                "Download the ZIP, extract it, and replace your app folder.\n\n"
-                "Keep your data\\license.json file if you want to keep the same license.",
-            )
-
-    def _run_git_update(self) -> None:
-        self._enqueue_log("Applying update…")
-
-        def work() -> None:
-            ok, msg = apply_git_update(self._enqueue_log)
-
-            def done() -> None:
-                self._refresh_version_label()
+                version_label.text = f"v{get_studio_release_version()}"
                 if ok:
-                    status = check_for_updates()
-                    self._set_update_status(status)
-                    messagebox.showinfo(
-                        "Updated",
-                        f"{msg}\n\nSetup will run if anything new is needed.",
-                    )
-                    if status.update_available:
-                        messagebox.showwarning(
-                            "Update incomplete",
-                            "Files were pulled but version did not change.\n\n"
-                            "Use Check for updates → No to download the ZIP.",
-                        )
-                    else:
-                        self._update_snoozed = True
-                    self._run_setup()
+                    state.update_snoozed = True
+                    ui.notify(msg, type="positive")
+                    run_setup()
                 else:
-                    messagebox.showerror("Update failed", msg)
+                    ui.notify(msg, type="negative")
 
-            self.root.after(0, done)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _build_license_panel(self) -> None:
-        frame = tk.LabelFrame(
-            self.root,
-            text=" License ",
-            font=("Segoe UI", 10, "bold"),
-            fg=TEXT,
-            bg=PANEL,
-            labelanchor="n",
-        )
-        frame.pack(fill="x", padx=16, pady=(4, 8))
-
-        inner = tk.Frame(frame, bg=PANEL)
-        inner.pack(fill="x", padx=12, pady=10)
-
-        top = tk.Frame(inner, bg=PANEL)
-        top.pack(fill="x")
-
-        self.license_state_var = tk.StringVar(value="Checking…")
-        self.license_state_label = tk.Label(
-            top,
-            textvariable=self.license_state_var,
-            font=("Segoe UI", 12, "bold"),
-            fg=TEXT,
-            bg=PANEL,
-        )
-        self.license_state_label.pack(side="left")
-
-        ttk.Button(top, text="Enter license", command=lambda: self._show_license_dialog()).pack(
-            side="right"
-        )
-
-        self.license_remaining_var = tk.StringVar(value="—")
-        self.license_remaining_label = tk.Label(
-            inner,
-            textvariable=self.license_remaining_var,
-            font=("Segoe UI", 14, "bold"),
-            fg=OK,
-            bg=PANEL,
-        )
-        self.license_remaining_label.pack(anchor="w", pady=(8, 2))
-
-        self.license_expires_var = tk.StringVar(value="")
-        tk.Label(
-            inner,
-            textvariable=self.license_expires_var,
-            font=("Segoe UI", 9),
-            fg=MUTED,
-            bg=PANEL,
-        ).pack(anchor="w")
-
-        self.license_type_var = tk.StringVar(value="")
-        tk.Label(
-            inner,
-            textvariable=self.license_type_var,
-            font=("Segoe UI", 8),
-            fg=MUTED,
-            bg=PANEL,
-        ).pack(anchor="w", pady=(2, 0))
-
-        self.license_progress = ttk.Progressbar(inner, maximum=100, mode="determinate")
-        self.license_progress.pack_forget()
-
-    def _show_log_panel_if_hidden(self) -> None:
-        if not self._log_visible:
-            self._toggle_log()
-
-    def _clear_log(self) -> None:
-        self.log_box.configure(state="normal")
-        self.log_box.delete("1.0", tk.END)
-        self.log_box.configure(state="disabled")
-        self._log_line_count = 0
-
-    def _toggle_log(self) -> None:
-        if self._log_visible:
-            self.log_frame.pack_forget()
-            self._log_visible = False
-            self.log_toggle_btn.configure(text="Show activity log")
-        else:
-            self.log_frame.pack(fill="both", expand=True, padx=16, pady=(8, 12))
-            self._log_visible = True
-            self.log_toggle_btn.configure(text="Hide activity log")
-
-    def _apply_checks(self, checks) -> None:
-        for child in self.req_grid.winfo_children():
-            child.destroy()
-
-        for i, item in enumerate(checks):
-            icon = "✓" if item.ok else ("!" if not item.required else "✗")
-            color = OK if item.ok else (WARN if not item.required else ERR)
-            row = tk.Frame(self.req_grid, bg=PANEL)
-            row.grid(row=i // 2, column=i % 2, sticky="w", padx=6, pady=3)
-
-            tk.Label(
-                row, text=icon, fg=color, bg=PANEL, width=2, font=("Segoe UI", 10, "bold")
-            ).pack(side="left")
-            tk.Label(
-                row,
-                text=f"{item.label}: {item.detail}",
-                fg=TEXT,
-                bg=PANEL,
-                font=("Segoe UI", 9),
-                anchor="w",
-            ).pack(side="left")
-
-        self._checks_busy = False
-
-    def refresh_checks_async(self) -> None:
-        if self._checks_busy:
-            return
-        self._checks_busy = True
-
-        def work() -> None:
-            checks = run_checks()
-            self.root.after(0, lambda: self._apply_checks(checks))
+            ui.timer(0.01, done, once=True)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _run_async(self, fn, *, refresh_after: bool = True) -> None:
-        def worker() -> None:
-            try:
-                fn()
-            except Exception as exc:
-                self._enqueue_log(f"Error: {exc}")
-            finally:
-                if refresh_after:
-                    self.root.after(0, self.refresh_checks_async)
+    # timers
+    ui.timer(0.15, poll_log)
+    ui.timer(3.0, poll_servers)
+    ui.timer(60.0, poll_license)
+    ui.timer(5.0, check_updates_quiet, once=True)
+    ui.timer(0.5, refresh_checks, once=True)
 
-        threading.Thread(target=worker, daemon=True).start()
+    state.enqueue_log(f"Welcome to {STUDIO_NAME}")
+    if not state.setup_started:
+        state.setup_started = True
+        ui.timer(0.3, auto_setup, once=True)
 
-    def _set_setup_busy(self, busy: bool) -> None:
-        try:
-            self.setup_btn.configure(state="disabled" if busy else "normal")
-        except Exception:
-            pass
 
-    def _run_setup(self) -> None:
-        self.root.after(0, self._show_log_panel_if_hidden)
-        self.root.after(0, lambda: self._begin_activity("Running setup…"))
-        self.root.after(0, lambda: self._set_setup_busy(True))
-        self._last_progress_log_pct = -1
-        self._enqueue_log("Running setup…")
-
-        def work() -> None:
-            try:
-                ok = self.manager.setup()
-                if not ok:
-                    self.root.after(0, lambda: self._finish_activity(success=False))
-            except Exception as exc:
-                self._enqueue_log(f"Error: {exc}")
-                self.root.after(0, lambda: self._finish_activity(success=False))
-            finally:
-                self.root.after(0, lambda: self._set_setup_busy(False))
-                self.root.after(0, self.refresh_checks_async)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _start(self) -> None:
-        if not self._ensure_licensed():
-            return
-
-        def work() -> None:
-            checks = run_checks()
-            ready = all(c.ok for c in checks if c.required and c.key != "servers")
-            if not ready:
-
-                def ask() -> None:
-                    if messagebox.askyesno(
-                        "Setup required",
-                        "Some requirements are missing.\n\nRun setup now?",
-                    ):
-                        self._run_setup()
-
-                self.root.after(0, ask)
-                return
-            self.manager.start(open_browser=True)
-            self.root.after(0, self._wait_and_refresh_checks)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _stop(self) -> None:
-        self._run_async(self.manager.stop)
-
-    def _open_ui(self) -> None:
-        if not self._ensure_licensed():
-            return
-
-        def work() -> None:
-            if not self.manager.running and not (_port_open(8000) and _port_open(3000)):
-                checks = run_checks()
-                ready = all(c.ok for c in checks if c.required and c.key != "servers")
-                if not ready:
-                    self.root.after(
-                        0,
-                        lambda: messagebox.showwarning(
-                            "Setup required",
-                            "Finish setup first (Run setup), then open the UI.",
-                        ),
-                    )
-                    return
-                if not self.manager.start(open_browser=False):
-                    return
-                self.root.after(0, self._wait_and_refresh_checks)
-            import webbrowser
-
-            webbrowser.open("http://localhost:3000/home")
-            if self.manager.running or (_port_open(8000) and _port_open(3000)):
-                self.root.after(0, self.refresh_checks_async)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _on_close(self) -> None:
-        if self.manager.running:
-            if messagebox.askyesno("Quit", "Stop servers and close launcher?"):
-                self.manager.stop()
-            else:
-                return
-        self.root.destroy()
-
-    def run(self) -> None:
-        self.root.mainloop()
+def _escape_html(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
 
 
 def main() -> None:
-    StudioLauncherApp().run()
+    if not _ensure_nicegui():
+        _run_tk_fallback("NiceGUI not installed — using classic launcher. Run Setup, then restart.")
+        return
+
+    from nicegui import ui
+
+    build_ui()
+
+    def on_shutdown() -> None:
+        if state.manager.running:
+            state.manager.stop()
+
+    ui.on_shutdown(on_shutdown)
+    favicon = str(ICON_ICO) if ICON_ICO.is_file() else str(ICON_PNG) if ICON_PNG.is_file() else None
+    ui.run(
+        native=True,
+        port=LAUNCHER_PORT,
+        reload=False,
+        title=STUDIO_NAME,
+        window_size=(920, 860),
+        favicon=favicon,
+    )
 
 
 if __name__ == "__main__":
