@@ -10,6 +10,8 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -26,6 +28,7 @@ TORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu126"
 TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
 WINGET_PYTHON_ID = "Python.Python.3.12"
 WINGET_NODE_ID = "OpenJS.NodeJS.LTS"
+PYTHON_312_INSTALLER_URL = "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"
 WINGET_UNSUPPORTED_PYTHON_IDS = tuple(f"Python.Python.3.{minor}" for minor in range(13, 20))
 WINGET_LEGACY_NODE_IDS = tuple(f"OpenJS.NodeJS.{minor}" for minor in range(10, 18))
 
@@ -476,8 +479,8 @@ def _remove_unsupported_winget_python(log: LogFn) -> None:
 
 def _install_studio_python_windows(log: LogFn) -> bool:
     if not _winget_available():
-        log("winget is not available — cannot auto-install Python 3.12.")
-        return False
+        log("winget is not available — trying direct Python installer download…")
+        return _install_python_312_direct_windows(log)
 
     log("Installing Python 3.12 via winget (may prompt for admin approval)…")
     if _winget_install(WINGET_PYTHON_ID, log):
@@ -493,6 +496,45 @@ def _install_studio_python_windows(log: LogFn) -> bool:
         return True
 
     return _winget_list_has(WINGET_PYTHON_ID)
+
+
+def _install_python_312_direct_windows(log: LogFn) -> bool:
+    installer_path = ""
+    try:
+        fd, temp_path = tempfile.mkstemp(prefix="sinekool_py312_", suffix=".exe")
+        os.close(fd)
+        installer_path = temp_path
+        log("Downloading Python 3.12 installer from python.org…")
+        with urllib.request.urlopen(PYTHON_312_INSTALLER_URL, timeout=120) as resp, open(installer_path, "wb") as out:
+            out.write(resp.read())
+
+        log("Running Python 3.12 installer silently (per-user)…")
+        rc = _run_live(
+            [
+                installer_path,
+                "/quiet",
+                "InstallAllUsers=0",
+                "PrependPath=1",
+                "Include_test=0",
+                "Shortcuts=0",
+                "Include_launcher=1",
+            ],
+            log=log,
+        )
+        _refresh_windows_path()
+        if rc == 0:
+            return True
+        log(f"Direct installer exited with code {rc}.")
+        return False
+    except Exception as exc:
+        log(f"Direct Python installer failed: {exc}")
+        return False
+    finally:
+        if installer_path and os.path.isfile(installer_path):
+            try:
+                os.remove(installer_path)
+            except Exception:
+                pass
 
 
 def _wait_for_studio_python(log: LogFn, *, seconds: int = 90) -> str | None:
