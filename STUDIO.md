@@ -4,7 +4,7 @@ One-click local Studio: voice synthesis UI + API, with automatic setup on first 
 
 ## Quick start
 
-1. **Clone the repo**
+1. **Get the app** (use `git clone` — do **not** use GitHub “Download ZIP”):
    ```bash
    git clone https://github.com/angkormax2/voxcpm.git
    cd voxcpm
@@ -63,7 +63,8 @@ One-click local Studio: voice synthesis UI + API, with automatic setup on first 
 - **winget fails or asks for admin** — install [Python](https://www.python.org/downloads/) and [Node.js LTS](https://nodejs.org/) manually, then run `VoxCPM Studio.bat` again.
 - **Ports in use** — run `stop.bat`, then start Studio again.
 - **GPU shows CPU** — update NVIDIA drivers and run Setup again so CUDA PyTorch is installed.
-- **Online key fails** — check internet and contact the author if the key was revoked or expired.
+- **Setup fails on “setuptools-scm was unable to detect version”** — you used **Download ZIP** instead of `git clone`. Clone the repo, or download the latest update (ZIP installs are supported after the version fallback fix).
+- **Python 3.14+** — use **Python 3.10–3.12** if setup fails on torch or other packages.
 
 ## Files
 

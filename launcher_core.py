@@ -71,9 +71,13 @@ def _run(
     *,
     cwd: Path | None = None,
     log: LogFn | None = None,
+    env: dict[str, str] | None = None,
 ) -> int:
     if log:
         log(f"$ {' '.join(cmd)}")
+    run_env = os.environ.copy()
+    if env:
+        run_env.update(env)
     proc = subprocess.run(
         cmd,
         cwd=str(cwd or PROJECT_ROOT),
@@ -81,6 +85,7 @@ def _run(
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=run_env,
         **_subprocess_hide_kwargs(),
     )
     if log:
@@ -581,7 +586,11 @@ class StudioManager:
             )
 
         self.log("Installing Python package (editable)…")
-        if _run(pip + ["install", "-e", "."], log=self.log) != 0:
+        pip_env = {
+            # ZIP downloads have no .git; setuptools-scm needs a version fallback.
+            "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VOXCPM": "2.0.0",
+        }
+        if _run(pip + ["install", "-e", "."], log=self.log, env=pip_env) != 0:
             self.log("Python install failed.")
             return False
 
