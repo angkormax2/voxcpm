@@ -6,7 +6,12 @@ import os
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-STUDIO_NAME = "VoxCPM2 Studio By BONG Pisith"
+ASSETS_DIR = PROJECT_ROOT / "assets"
+STUDIO_NAME = "SINEKOOL AI"
+STUDIO_SLOGAN = "Smart Voice, Cool Identity."
+STUDIO_LOGO_TEXT = ASSETS_DIR / "sinekool_text.png"
+STUDIO_LOGO_ICON = ASSETS_DIR / "sinekool_icon.png"
+STUDIO_LAUNCHER_ICO = ASSETS_DIR / "sinekool_logo.ico"
 LICENSE_CONTACT_URL = "https://t.me/rornpisith"
 LICENSE_CONTACT_LABEL = "Telegram @rornpisith"
 LICENSE_CONTACT_HINT = "Send your Machine ID to get a license key"

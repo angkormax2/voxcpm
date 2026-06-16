@@ -19,6 +19,9 @@ from studio_branding import (
     LICENSE_CONTACT_HINT,
     LICENSE_CONTACT_LABEL,
     LICENSE_CONTACT_URL,
+    STUDIO_LAUNCHER_ICO,
+    STUDIO_LOGO_ICON,
+    STUDIO_LOGO_TEXT,
     STUDIO_NAME,
     get_studio_release_version,
 )
@@ -35,9 +38,9 @@ from launcher_core import (
 )
 
 ASSETS = PROJECT_ROOT / "assets"
-ICON_ICO = ASSETS / "studio_launcher.ico"
-ICON_PNG = ASSETS / "studio_icon.png"
-LOGO_HEADER = ASSETS / "studio_logo_header.png"
+ICON_ICO = STUDIO_LAUNCHER_ICO
+ICON_PNG = STUDIO_LOGO_ICON
+LOGO_HEADER = STUDIO_LOGO_TEXT
 
 BG = "#0f1117"
 PANEL = "#1a1d2e"
@@ -429,21 +432,22 @@ class StudioLauncherApp:
             tk.Label(title_row, image=self._header_logo, bg=BG).pack(side="left", padx=(0, 12))
 
         title_text = tk.Frame(title_row, bg=BG)
-        title_text.pack(side="left")
-        tk.Label(
-            title_text,
-            text=STUDIO_NAME,
-            font=("Segoe UI", 18, "bold"),
-            fg=TEXT,
-            bg=BG,
-        ).pack(anchor="w")
-        tk.Label(
-            title_text,
-            text="Voice studio · setup runs quietly in the background",
-            font=("Segoe UI", 10),
-            fg=MUTED,
-            bg=BG,
-        ).pack(anchor="w")
+        if self._header_logo is None or not LOGO_HEADER.is_file():
+            title_text.pack(side="left")
+            tk.Label(
+                title_text,
+                text=STUDIO_NAME,
+                font=("Segoe UI", 18, "bold"),
+                fg=TEXT,
+                bg=BG,
+            ).pack(anchor="w")
+            tk.Label(
+                title_text,
+                text="Voice studio · setup runs quietly in the background",
+                font=("Segoe UI", 10),
+                fg=MUTED,
+                bg=BG,
+            ).pack(anchor="w")
 
         self.access_var = tk.StringVar()
         self._build_license_panel()

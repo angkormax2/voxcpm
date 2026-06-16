@@ -72,7 +72,7 @@ const Logo = ({ color }: { color?: CSSProperties['color'] }) => {
     <div className='flex items-center min-bs-[24px]'>
       <Image
         src={APP_ICON_PATH}
-        alt='VoxCPM'
+        alt='SINEKOOL AI'
         width={28}
         height={28}
         className='rounded-[6px] shrink-0'

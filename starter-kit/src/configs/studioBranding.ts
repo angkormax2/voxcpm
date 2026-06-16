@@ -1,3 +1,4 @@
-export const STUDIO_NAME = 'VoxCPM2 Studio By BONG Pisith'
-export const SIDEBAR_APP_NAME = 'VoxCPM'
-export const APP_ICON_PATH = '/images/voxcpm-icon.png'
+export const STUDIO_NAME = 'SINEKOOL AI'
+export const SIDEBAR_APP_NAME = 'SINEKOOL AI'
+export const APP_ICON_PATH = '/images/sinekool_icon.png'
+export const APP_TEXT_LOGO_PATH = '/images/sinekool_text.png'
