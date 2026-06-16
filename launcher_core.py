@@ -25,6 +25,9 @@ TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
 WINGET_PYTHON_ID = "Python.Python.3.12"
 WINGET_NODE_ID = "OpenJS.NodeJS.LTS"
 HF_VOXCPM2_REPO = "openbmb/VoxCPM2"
+STUDIO_PYTHON_MIN = (3, 10)
+STUDIO_PYTHON_MAX = (3, 12)
+STUDIO_PACKAGE_VERSION = "2.0.0"
 
 LogFn = Callable[[str], None]
 
@@ -102,6 +105,185 @@ def _which(name: str) -> str | None:
     return shutil.which(name)
 
 
+def _python_version_tuple(exe: str) -> tuple[int, int] | None:
+    try:
+        out = subprocess.check_output(
+            [exe, "-c", "import sys; print(sys.version_info[0], sys.version_info[1])"],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **_subprocess_hide_kwargs(),
+        ).strip()
+        major, minor = out.split()[:2]
+        return int(major), int(minor)
+    except Exception:
+        return None
+
+
+def _python_supported(ver: tuple[int, int] | None) -> bool:
+    if ver is None:
+        return False
+    return STUDIO_PYTHON_MIN <= ver <= STUDIO_PYTHON_MAX
+
+
+def _python_label(exe: str) -> str:
+    ver = _python_version_tuple(exe)
+    if ver:
+        return f"Python {ver[0]}.{ver[1]} ({exe})"
+    return exe
+
+
+def _py_launcher_exe(version: str) -> str | None:
+    py = _which("py")
+    if not py:
+        return None
+    try:
+        out = subprocess.check_output(
+            [py, f"-{version}", "-c", "import sys; print(sys.executable)"],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **_subprocess_hide_kwargs(),
+        ).strip()
+        if out and Path(out).is_file():
+            return out
+    except Exception:
+        pass
+    return None
+
+
+def _iter_python_candidates() -> list[str]:
+    seen: set[str] = set()
+    candidates: list[str] = []
+
+    def add(exe: str | None) -> None:
+        if not exe:
+            return
+        exe = str(Path(exe).resolve())
+        if exe in seen or not Path(exe).is_file():
+            return
+        seen.add(exe)
+        candidates.append(exe)
+
+    if sys.platform == "win32":
+        for tag in ("3.12", "3.11", "3.10"):
+            add(_py_launcher_exe(tag))
+        local = os.environ.get("LOCALAPPDATA", "")
+        for rel in (
+            r"Programs\Python\Python312\python.exe",
+            r"Programs\Python\Python311\python.exe",
+            r"Programs\Python\Python310\python.exe",
+        ):
+            add(os.path.join(local, rel))
+        for rel in (
+            r"C:\Program Files\Python312\python.exe",
+            r"C:\Program Files\Python311\python.exe",
+            r"C:\Program Files\Python310\python.exe",
+        ):
+            add(rel)
+
+    add(_which("python"))
+    if sys.executable:
+        add(sys.executable)
+    return candidates
+
+
+def _find_studio_python(log: LogFn | None = None) -> str | None:
+    for exe in _iter_python_candidates():
+        if _python_supported(_python_version_tuple(exe)):
+            if log:
+                log(f"Using {_python_label(exe)}")
+            return exe
+    return None
+
+
+def _ensure_studio_python(log: LogFn) -> str | None:
+    py = _find_studio_python(log)
+    if py:
+        return py
+
+    current = _which("python") or sys.executable
+    ver = _python_version_tuple(current) if current else None
+    if ver and not _python_supported(ver):
+        log(
+            f"Python {ver[0]}.{ver[1]} is not supported for Studio "
+            f"(use {STUDIO_PYTHON_MIN[0]}.{STUDIO_PYTHON_MIN[1]}–"
+            f"{STUDIO_PYTHON_MAX[0]}.{STUDIO_PYTHON_MAX[1]})."
+        )
+
+    if sys.platform == "win32" and _winget_available():
+        log("Installing Python 3.12 via winget…")
+        if _winget_install(WINGET_PYTHON_ID, log):
+            _refresh_windows_path()
+            py = _find_studio_python()
+            if py:
+                log(f"Using {_python_label(py)}")
+                return py
+
+    log(
+        f"Install Python {STUDIO_PYTHON_MIN[0]}.{STUDIO_PYTHON_MIN[1]}–"
+        f"{STUDIO_PYTHON_MAX[0]}.{STUDIO_PYTHON_MAX[1]} from https://www.python.org/downloads/"
+    )
+    return None
+
+
+def _pip_env() -> dict[str, str]:
+    return {
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VOXCPM": STUDIO_PACKAGE_VERSION,
+    }
+
+
+def _pip_bootstrap(pip: list[str], log: LogFn) -> None:
+    _run(
+        pip + ["install", "--upgrade", "pip", "setuptools", "wheel"],
+        log=log,
+        env=_pip_env(),
+    )
+
+
+def _pip_install_project(pip: list[str], log: LogFn) -> bool:
+    env = _pip_env()
+    attempts = (
+        pip + ["install", "-e", "."],
+        pip + ["install", "."],
+    )
+    for cmd in attempts:
+        label = "editable" if "-e" in cmd else "standard"
+        log(f"Installing VoxCPM package ({label})…")
+        if _run(cmd, log=log, env=env) != 0:
+            continue
+        if (
+            _run(
+                [str(VENV_PYTHON), "-c", "import voxcpm; print('voxcpm', voxcpm.__version__ if hasattr(voxcpm, '__version__') else 'ok')"],
+                log=log,
+            )
+            == 0
+        ):
+            return True
+    return False
+
+
+def _ensure_venv(py_exe: str, log: LogFn) -> bool:
+    if VENV_PYTHON.is_file():
+        venv_ver = _python_version_tuple(str(VENV_PYTHON))
+        if _python_supported(venv_ver):
+            return True
+        shown = f"{venv_ver[0]}.{venv_ver[1]}" if venv_ver else "unknown"
+        log(f"Recreating .venv (found Python {shown}, need 3.10–3.12)…")
+        shutil.rmtree(PROJECT_ROOT / ".venv", ignore_errors=True)
+
+    log("Creating virtual environment…")
+    venv_path = PROJECT_ROOT / ".venv"
+    if _which("uv"):
+        if _run(["uv", "venv", str(venv_path), "--python", py_exe], log=log) == 0:
+            return VENV_PYTHON.is_file()
+    if _run([py_exe, "-m", "venv", str(venv_path)], log=log) != 0:
+        log("Failed to create .venv")
+        return False
+    return VENV_PYTHON.is_file()
+
+
 def _winget_available() -> bool:
     return _which("winget") is not None
 
@@ -146,38 +328,24 @@ def _winget_install(package_id: str, log: LogFn) -> bool:
 
 
 def ensure_prerequisites(log: LogFn) -> bool:
-    """Ensure Python and Node.js exist; on Windows try winget if missing."""
-    missing_py = not _which("python")
-    missing_node = not _which("node")
-    if not missing_py and not missing_node:
-        return True
+    """Ensure supported Python and Node.js exist; on Windows try winget if missing."""
+    if not _ensure_studio_python(log):
+        return False
 
-    if sys.platform != "win32":
-        if missing_py:
-            log("Python not found. Install Python 3.10+ from https://www.python.org/downloads/")
-            return False
-        if missing_node:
+    if not _which("node"):
+        if sys.platform != "win32":
             log("Node.js not found. Install from https://nodejs.org/")
             return False
-        return True
-
-    if not _winget_available():
-        log("winget not found. Install Python 3.10+ and Node.js 18+ manually.")
-        return False
-
-    if missing_py and not _winget_install(WINGET_PYTHON_ID, log):
-        log("Python install failed. Install from https://www.python.org/downloads/")
-        return False
-    if missing_py and not _which("python"):
-        log("Python installed but not on PATH. Restart the launcher or log in again.")
-        return False
-
-    if missing_node and not _winget_install(WINGET_NODE_ID, log):
-        log("Node.js install failed. Install from https://nodejs.org/")
-        return False
-    if missing_node and not _which("node"):
-        log("Node.js installed but not on PATH. Restart the launcher or log in again.")
-        return False
+        if not _winget_available():
+            log("Node.js not found. Install from https://nodejs.org/")
+            return False
+        if not _winget_install(WINGET_NODE_ID, log):
+            log("Node.js install failed. Install from https://nodejs.org/")
+            return False
+        _refresh_windows_path()
+        if not _which("node"):
+            log("Node.js installed but not on PATH. Restart the launcher or log in again.")
+            return False
 
     return True
 
@@ -281,26 +449,23 @@ def run_checks() -> list[CheckResult]:
     results: list[CheckResult] = []
     hide = _subprocess_hide_kwargs()
 
-    py = _which("python") or sys.executable
+    py = _find_studio_python() or _which("python") or sys.executable
     py_ver = ""
+    py_ok = False
     if py:
-        try:
-            py_ver = subprocess.check_output(
-                [py, "--version"],
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                **hide,
-            ).strip()
-        except Exception:
+        ver = _python_version_tuple(py)
+        if ver:
+            py_ver = f"Python {ver[0]}.{ver[1]}"
+            py_ok = _python_supported(ver)
+        else:
             py_ver = "unknown"
     results.append(
         CheckResult(
             key="python",
             label="Python",
-            ok=bool(py),
+            ok=py_ok,
             detail=py_ver or "Not found",
-            fix_hint="Install Python 3.10+ or run Setup",
+            fix_hint="Setup installs Python 3.12 automatically on Windows",
         )
     )
 
@@ -440,6 +605,28 @@ def required_ready(checks: list[CheckResult]) -> bool:
     return all(c.ok for c in checks if c.required)
 
 
+def _studio_environment_ready() -> bool:
+    """True when venv, package imports, and frontend deps are usable."""
+    if not VENV_PYTHON.is_file():
+        return False
+    if not _python_supported(_python_version_tuple(str(VENV_PYTHON))):
+        return False
+    hide = _subprocess_hide_kwargs()
+    for code in ("import torch", "import voxcpm"):
+        try:
+            subprocess.check_call(
+                [str(VENV_PYTHON), "-c", code],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                **hide,
+            )
+        except Exception:
+            return False
+    if not (STARTER_KIT / "node_modules").is_dir():
+        return False
+    return True
+
+
 def wait_for_servers(timeout_sec: int = 90) -> bool:
     for _ in range(timeout_sec):
         if _port_open(8000) and _port_open(3000):
@@ -453,11 +640,10 @@ def bootstrap_setup(manager: StudioManager) -> bool:
     if not ensure_prerequisites(manager.log):
         return False
     manager.log("Checking requirements…")
-    checks = run_checks()
-    if not required_ready(checks):
-        manager.log("Running first-time setup…")
+    if not _studio_environment_ready():
+        manager.log("Running first-time setup (one click — please wait)…")
         if not manager.setup():
-            manager.log("Setup failed.")
+            manager.log("Setup failed. Open setup log for details, then click Run setup again.")
             return False
     manager.log("Setup check complete.")
     return True
@@ -548,22 +734,18 @@ class StudioManager:
         self.log("=== Setup started ===")
         if not ensure_prerequisites(self.log):
             return False
+
+        py_exe = _ensure_studio_python(self.log)
+        if not py_exe:
+            return False
+        if not _ensure_venv(py_exe, self.log):
+            return False
+
         checks = run_checks()
         has_nvidia = next((c.ok for c in checks if c.key == "gpu"), False)
 
-        if not VENV_PYTHON.is_file():
-            self.log("Creating virtual environment…")
-            py = _which("python") or sys.executable
-            if _which("uv"):
-                if _run(["uv", "venv", str(PROJECT_ROOT / ".venv"), "--python", py], log=self.log) != 0:
-                    if _run([py, "-m", "venv", str(PROJECT_ROOT / ".venv")], log=self.log) != 0:
-                        self.log("Failed to create .venv")
-                        return False
-            elif _run([py, "-m", "venv", str(PROJECT_ROOT / ".venv")], log=self.log) != 0:
-                self.log("Failed to create .venv")
-                return False
-
         pip = [str(VENV_PYTHON), "-m", "pip"]
+        _pip_bootstrap(pip, self.log)
 
         torch_ok = False
         try:
@@ -583,14 +765,10 @@ class StudioManager:
             _run(
                 pip + ["install", "torch", "torchaudio", "--index-url", index],
                 log=self.log,
+                env=_pip_env(),
             )
 
-        self.log("Installing Python package (editable)…")
-        pip_env = {
-            # ZIP downloads have no .git; setuptools-scm needs a version fallback.
-            "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VOXCPM": "2.0.0",
-        }
-        if _run(pip + ["install", "-e", "."], log=self.log, env=pip_env) != 0:
+        if not _pip_install_project(pip, self.log):
             self.log("Python install failed.")
             return False
 
