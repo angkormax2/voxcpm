@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -94,8 +95,9 @@ def _git_available() -> bool:
 
 
 def fetch_latest_version(*, timeout: int = 20) -> str:
+    url = f"{_version_url()}?t={int(time.time())}"
     req = urllib.request.Request(
-        _version_url(),
+        url,
         headers={"User-Agent": "VoxCPM2-Studio-Updater/1.0"},
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
