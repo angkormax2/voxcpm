@@ -28,7 +28,8 @@ import {
   InputLabel,
   Select,
   MenuItem,
-  Tooltip
+  Tooltip,
+  LinearProgress
 } from "@mui/material";
 import Dialog from "@mui/material/Dialog";
 import DialogTitle from "@mui/material/DialogTitle";
@@ -45,8 +46,7 @@ const GENDER_LABELS: Record<string, string> = {
   male: "Male",
   female: "Female",
   child: "Child",
-  neutral: "Neutral",
-  unknown: "Unknown"
+  neutral: "Neutral"
 };
 
 type VoiceOption = {
@@ -65,6 +65,48 @@ type BatchItem = {
   status: BatchStatus;
   error?: string;
 };
+
+type OutputFile = {
+  name: string;
+  size_bytes: number;
+  modified_at: string;
+};
+
+function formatDuration(sec?: number | null): string {
+  if (sec == null || Number.isNaN(sec)) return "";
+  const total = Math.max(0, Math.round(sec));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+function shortOutputName(name: string): string {
+  if (name.length <= 32) return name;
+  return `${name.slice(0, 14)}…${name.slice(-16)}`;
+}
+
+function formatSavedTime(iso?: string): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso.replace("T", " ").slice(0, 16);
+  return d.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+}
+
+function historyRowTitle(file: OutputFile): string {
+  return formatSavedTime(file.modified_at) || shortOutputName(file.name);
+}
+
+function outputFileUrl(name: string): string {
+  return `${API_BASE}/outputs/file/${encodeURIComponent(name)}`;
+}
 
 function base64ToBlob(b64: string, mime: string): Blob {
   const bytes = atob(b64);
@@ -110,6 +152,10 @@ export default function VoxCPMStudio() {
   const [savingLast, setSavingLast] = useState(false);
   const [outputFolder, setOutputFolder] = useState("");
   const [outputCount, setOutputCount] = useState(0);
+  const [outputFiles, setOutputFiles] = useState<OutputFile[]>([]);
+  const [outputMeta, setOutputMeta] = useState<Record<string, { genSec: number; audioSec?: number }>>({});
+  const [lastFinishInfo, setLastFinishInfo] = useState<{ genSec: number; audioSec?: number } | null>(null);
+  const [activeOutputName, setActiveOutputName] = useState<string | null>(null);
   const [elapsedSec, setElapsedSec] = useState(0);
   const [etaSec, setEtaSec] = useState<number | null>(null);
   const [genStartedAt, setGenStartedAt] = useState<number | null>(null);
@@ -119,8 +165,17 @@ export default function VoxCPMStudio() {
   const [batchItems, setBatchItems] = useState<BatchItem[]>([]);
   const [batchRunning, setBatchRunning] = useState(false);
   const [deleteOutputsDialogOpen, setDeleteOutputsDialogOpen] = useState(false);
+  const [deleteOneOutputName, setDeleteOneOutputName] = useState<string | null>(null);
+  const [showOutputDetails, setShowOutputDetails] = useState(false);
+
+  // --- License chunk limits ---
+  const [licenseMaxChunks, setLicenseMaxChunks] = useState<number | null>(null);
+  const [licenseWarningThreshold, setLicenseWarningThreshold] = useState<number | null>(null);
+  const [licenseChunkChars, setLicenseChunkChars] = useState(260);
+  const [showUpgradeDialog, setShowUpgradeDialog] = useState(false);
 
   const logBoxRef = useRef<HTMLDivElement>(null);
+  const mainAudioRef = useRef<HTMLAudioElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const saveFileRef = useRef<HTMLInputElement>(null);
 
@@ -137,8 +192,13 @@ export default function VoxCPMStudio() {
   }, [savedVoices, speakerGender]);
 
   useEffect(() => {
+    if (loading) setShowOutputDetails(true);
+  }, [loading]);
+
+  useEffect(() => {
     fetchVoices();
     void fetchOutputStats();
+    void fetchLicenseLimits();
   }, []);
 
   useEffect(() => {
@@ -176,8 +236,59 @@ export default function VoxCPMStudio() {
       const res = await axios.get(`${API_BASE}/outputs`);
       setOutputFolder(String(res.data.folder || ""));
       setOutputCount(Number(res.data.count || 0));
+      setOutputFiles((res.data.files || []) as OutputFile[]);
     } catch (err) {
       console.error("Failed to fetch output stats", err);
+    }
+  };
+
+  const fetchLicenseLimits = async () => {
+    try {
+      const res = await axios.get(`${API_BASE}/license-limits`);
+      setLicenseMaxChunks(res.data.max_chunks ?? null);
+      setLicenseWarningThreshold(res.data.warning_threshold ?? null);
+      if (res.data.chunk_chars) setLicenseChunkChars(res.data.chunk_chars);
+    } catch (err) {
+      console.error("Failed to fetch license limits", err);
+    }
+  };
+
+  // Real-time chunk estimation based on text length
+  const estimatedChunks = useMemo(() => {
+    const cleaned = text.replace(/\s+/g, " ").trim();
+    if (!cleaned) return 0;
+    return Math.max(1, Math.ceil(cleaned.length / licenseChunkChars));
+  }, [text, licenseChunkChars]);
+
+  const isOverLimit = licenseMaxChunks != null && estimatedChunks > licenseMaxChunks;
+  const isOverWarning = !isOverLimit && licenseWarningThreshold != null && estimatedChunks > licenseWarningThreshold;
+
+  const selectOutputFile = (fileName: string) => {
+    setActiveOutputName(fileName);
+    setAudioUrl(outputFileUrl(fileName));
+    window.setTimeout(() => {
+      mainAudioRef.current?.play().catch(() => {});
+    }, 80);
+  };
+
+  const handleDeleteOneOutput = async (name: string) => {
+    try {
+      await axios.delete(`${API_BASE}/outputs/file/${encodeURIComponent(name)}`);
+      setOutputFiles(prev => prev.filter(f => f.name !== name));
+      setOutputMeta(prev => {
+        const next = { ...prev };
+        delete next[name];
+        return next;
+      });
+      setOutputCount(prev => Math.max(0, prev - 1));
+      if (activeOutputName === name) {
+        setActiveOutputName(null);
+        setAudioUrl("");
+      }
+      setInfo(`Removed ${name} from history.`);
+    } catch (err) {
+      console.error(err);
+      setError("Could not delete this audio file.");
     }
   };
 
@@ -196,6 +307,12 @@ export default function VoxCPMStudio() {
       const res = await axios.delete(`${API_BASE}/outputs`);
       setInfo(`Deleted ${res.data.deleted || 0} generated audio file(s).`);
       setOutputCount(0);
+      setOutputFiles([]);
+      setOutputMeta({});
+      setActiveOutputName(null);
+      setAudioUrl("");
+      setLastFinishInfo(null);
+      setLastMeta(null);
       await fetchOutputStats();
     } catch (err) {
       console.error(err);
@@ -386,6 +503,7 @@ export default function VoxCPMStudio() {
       sample_rate?: number;
       logs?: string[];
       voice_used?: string;
+      saved_file?: string;
     } | null = null;
     const streamLogs: string[] = [];
 
@@ -409,12 +527,18 @@ export default function VoxCPMStudio() {
             sample_rate?: number;
             logs?: string[];
             voice_used?: string;
+            saved_file?: string;
           };
           if (msg.type === "log" && msg.line) {
             streamLogs.push(msg.line);
             if (collectLogs) setLogs(prev => [...prev, msg.line as string]);
           } else if (msg.type === "plan" && msg.plan) {
             setSynthesisPlan(String(msg.plan));
+          } else if (msg.type === "chunk_limit") {
+            setShowUpgradeDialog(true);
+            throw new Error(msg.message || "Chunk limit exceeded");
+          } else if (msg.type === "chunk_warning" && msg.message) {
+            if (collectLogs) setLogs(prev => [...prev, `⚠️ ${msg.message}`]);
           } else if (msg.type === "error") {
             throw new Error(msg.message || "Synthesis failed");
           } else if (msg.type === "done") {
@@ -437,7 +561,8 @@ export default function VoxCPMStudio() {
       device: doneData.device,
       sampleRate: doneData.sample_rate,
       logs: doneData.logs || streamLogs,
-      voiceUsed: doneData.voice_used || ""
+      voiceUsed: doneData.voice_used || "",
+      savedFile: doneData.saved_file || ""
     };
   };
 
@@ -498,10 +623,8 @@ export default function VoxCPMStudio() {
     setLoading(true);
     setError("");
     setInfo("");
-    setAudioUrl("");
     setLogs([]);
     setSynthesisPlan("");
-    setLastMeta(null);
     setShowSaveLast(false);
     const startMs = Date.now();
     setGenStartedAt(startMs);
@@ -527,12 +650,24 @@ export default function VoxCPMStudio() {
         sampleRate: result.sampleRate
       });
       const actualSec = Math.max(1, Math.round((Date.now() - startMs) / 1000));
+      setLastFinishInfo({ genSec: actualSec, audioSec: result.duration });
       const chars = Math.max(1, text.trim().length);
       const normalized = actualSec / chars / Math.max(0.5, timesteps / 10);
       setAvgSecPerChar(prev => prev * 0.7 + normalized * 0.3);
 
-      if (audioUrl) URL.revokeObjectURL(audioUrl);
-      setAudioUrl(URL.createObjectURL(blob));
+      const savedName = result.savedFile || "";
+      if (savedName) {
+        setOutputMeta(prev => ({
+          ...prev,
+          [savedName]: { genSec: actualSec, audioSec: result.duration }
+        }));
+        setActiveOutputName(savedName);
+        setAudioUrl(outputFileUrl(savedName));
+      } else {
+        if (audioUrl.startsWith("blob:")) URL.revokeObjectURL(audioUrl);
+        setActiveOutputName(null);
+        setAudioUrl(URL.createObjectURL(blob));
+      }
       await fetchOutputStats();
       finishedOk = true;
     } catch (err: unknown) {
@@ -592,6 +727,41 @@ export default function VoxCPMStudio() {
                   },
                 }}
               />
+
+              {/* Chunk estimation and license limit warnings */}
+              {text.trim() && licenseMaxChunks != null && (
+                <Box sx={{ mt: 1, display: "flex", alignItems: "center", gap: 1 }}>
+                  <Typography variant="caption" color="text.secondary">
+                    Est. ~{estimatedChunks} chunk{estimatedChunks !== 1 ? "s" : ""} / {licenseMaxChunks} max
+                  </Typography>
+                  <LinearProgress
+                    variant="determinate"
+                    value={Math.min(100, (estimatedChunks / licenseMaxChunks) * 100)}
+                    sx={{
+                      flex: 1,
+                      height: 6,
+                      borderRadius: 3,
+                      bgcolor: "action.hover",
+                      "& .MuiLinearProgress-bar": {
+                        bgcolor: isOverLimit ? "error.main" : isOverWarning ? "warning.main" : "success.main"
+                      }
+                    }}
+                  />
+                </Box>
+              )}
+              {isOverWarning && (
+                <Alert severity="warning" sx={{ mt: 1 }}>
+                  ⚠️ Long text detected (est. ~{estimatedChunks} chunks). Processing may take several minutes and use significant GPU memory.
+                </Alert>
+              )}
+              {isOverLimit && (
+                <Alert severity="error" sx={{ mt: 1 }}>
+                  🚫 Text exceeds your plan limit ({estimatedChunks} / {licenseMaxChunks} chunks). Please shorten the text or{" "}
+                  <Box component="span" sx={{ cursor: "pointer", textDecoration: "underline", fontWeight: 700 }} onClick={() => setShowUpgradeDialog(true)}>
+                    contact your administrator to upgrade
+                  </Box>.
+                </Alert>
+              )}
             </CardContent>
           </Card>
 
@@ -817,7 +987,7 @@ export default function VoxCPMStudio() {
                 size="large"
                 fullWidth
                 onClick={handleGenerate}
-                disabled={loading || batchRunning}
+                disabled={loading || batchRunning || isOverLimit}
                 sx={{
                   mb: 1.25,
                   py: 1.25,
@@ -853,8 +1023,10 @@ export default function VoxCPMStudio() {
                 />
                 <Typography variant="caption" color="text.secondary" sx={{ lineHeight: 1.2 }}>
                   {loading
-                    ? `Elapsed: ${elapsedSec}s${etaSec != null ? ` · ETA: ~${etaSec}s` : ""}`
-                    : "Ready"}
+                    ? `Generating… ${formatDuration(elapsedSec)}${etaSec != null ? ` · ETA ~${formatDuration(etaSec)}` : ""}`
+                    : lastFinishInfo
+                      ? `Done in ${formatDuration(lastFinishInfo.genSec)}${lastFinishInfo.audioSec != null ? ` · Audio ${formatDuration(lastFinishInfo.audioSec)}` : ""}`
+                      : "Ready"}
                 </Typography>
               </Box>
               <Box sx={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 1, mb: 1.25 }}>
@@ -907,121 +1079,204 @@ export default function VoxCPMStudio() {
                   Refresh
                 </Button>
               </Box>
-              <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 1.25, fontSize: "0.72rem" }}>
-                Saved files: {outputCount}{outputFolder ? ` · ${outputFolder}` : ""}
-              </Typography>
-
-              <Typography variant="subtitle2" sx={{ mb: 0.75, fontWeight: 700 }}>
-                Process log
-              </Typography>
               <Box
-                ref={logBoxRef}
                 sx={{
                   mb: 1.5,
-                  maxHeight: 140,
-                  overflowY: "auto",
-                  overflowX: "hidden",
-                  bgcolor: "background.default",
-                  color: "text.primary",
-                  borderRadius: 2,
-                  p: 1.25,
-                  fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-                  fontSize: "0.72rem",
-                  lineHeight: 1.5,
+                  borderRadius: 2.5,
+                  overflow: "hidden",
                   border: "1px solid",
                   borderColor: "divider",
-                  overscrollBehavior: "contain",
+                  bgcolor: "background.default"
                 }}
               >
-                {logs.length === 0 && loading ? (
-                  <Typography variant="caption" color="text.secondary">
-                    Waiting for server…
-                  </Typography>
-                ) : logs.length === 0 ? (
-                  <Typography variant="caption" color="text.secondary">
-                    Logs appear here while synthesizing…
-                  </Typography>
-                ) : (
-                  logs.map((line, i) => <Box key={i}>{line}</Box>)
-                )}
-              </Box>
-              {synthesisPlan && (
                 <Box
                   sx={{
-                    mb: 1.25,
-                    p: 1.25,
-                    borderRadius: 2,
-                    bgcolor: "action.hover",
-                    border: "1px solid",
+                    px: 1.5,
+                    py: 1.25,
+                    borderBottom: "1px solid",
                     borderColor: "divider",
-                    maxHeight: 170,
-                    overflowY: "auto",
-                    overflowX: "hidden"
+                    bgcolor: theme =>
+                      theme.palette.mode === "dark" ? "rgba(255,255,255,0.03)" : "rgba(0,0,0,0.02)"
                   }}
                 >
-                  <Typography variant="caption" sx={{ display: "block", mb: 0.5, fontWeight: 700 }}>
-                    Synthesis plan
-                  </Typography>
-                  <Typography
-                    variant="caption"
-                    component="pre"
-                    sx={{
-                      m: 0,
-                      whiteSpace: "pre-wrap",
-                      display: "block",
-                      color: "text.secondary",
-                      fontFamily: "inherit",
-                      lineHeight: 1.45
-                    }}
-                  >
-                    {synthesisPlan}
-                  </Typography>
+                  <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", mb: 1 }}>
+                    <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                      Now playing
+                    </Typography>
+                    {outputCount > 0 && (
+                      <Typography variant="caption" color="text.secondary">
+                        {outputCount} saved
+                      </Typography>
+                    )}
+                  </Box>
+                  {(lastMeta || lastFinishInfo) && (
+                    <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5, mb: 1 }}>
+                      {lastFinishInfo && (
+                        <Chip size="small" label={`Gen ${formatDuration(lastFinishInfo.genSec)}`} sx={{ height: 22, fontSize: "0.68rem" }} />
+                      )}
+                      {(lastFinishInfo?.audioSec != null || lastMeta?.duration != null) && (
+                        <Chip
+                          size="small"
+                          color="primary"
+                          variant="outlined"
+                          label={formatDuration(lastFinishInfo?.audioSec ?? lastMeta?.duration)}
+                          sx={{ height: 22, fontSize: "0.68rem" }}
+                        />
+                      )}
+                    </Box>
+                  )}
+                  {audioUrl ? (
+                    <Box
+                      sx={{
+                        borderRadius: 1.5,
+                        p: 0.75,
+                        bgcolor: "background.paper",
+                        border: "1px solid",
+                        borderColor: "primary.main"
+                      }}
+                    >
+                      <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 0.5, px: 0.25 }} noWrap>
+                        {activeOutputName ? historyRowTitle(outputFiles.find(f => f.name === activeOutputName) || { name: activeOutputName, size_bytes: 0, modified_at: "" }) : "Latest"}
+                      </Typography>
+                      <audio
+                        ref={mainAudioRef}
+                        controls
+                        src={audioUrl}
+                        style={{ width: "100%", height: 36, display: "block" }}
+                      />
+                    </Box>
+                  ) : (
+                    <Box sx={{ py: 1.5, textAlign: "center", borderRadius: 1.5, bgcolor: "action.hover" }}>
+                      <Typography variant="caption" color="text.secondary">
+                        Synthesize audio to play here
+                      </Typography>
+                    </Box>
+                  )}
                 </Box>
-              )}
 
-              {lastMeta && (
-                <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 2 }}>
-                  {lastMeta.duration != null && `${lastMeta.duration}s`}
-                  {lastMeta.sampleRate && ` · ${lastMeta.sampleRate} Hz`}
-                  {lastMeta.device && ` · ${lastMeta.device.toUpperCase()}`}
-                </Typography>
-              )}
-
-              <Box
-                sx={{
-                  mb: 1.5,
-                  bgcolor: "background.paper",
-                  borderRadius: 2,
-                  p: 1.5,
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  border: "1px dashed",
-                  borderColor: "divider",
-                  minHeight: 78
-                }}
-              >
-                {audioUrl ? (
-                  <audio controls src={audioUrl} style={{ width: "100%" }} />
-                ) : (
-                  <Typography color="text.secondary" align="center" variant="body2">
-                    Audio output will appear here
+                <Box sx={{ px: 1.25, py: 1, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <Typography variant="caption" sx={{ fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.6, color: "text.secondary" }}>
+                    History
                   </Typography>
-                )}
+                  {outputFiles.length > 0 && (
+                    <Chip label={outputFiles.length} size="small" sx={{ height: 20, fontSize: "0.65rem" }} />
+                  )}
+                </Box>
+
+                <Box
+                  sx={{
+                    maxHeight: 176,
+                    overflowY: "auto",
+                    "&::-webkit-scrollbar": { width: 5 },
+                    "&::-webkit-scrollbar-thumb": { bgcolor: "divider", borderRadius: 3 }
+                  }}
+                >
+                  {outputFiles.length === 0 ? (
+                    <Typography variant="caption" color="text.secondary" sx={{ display: "block", px: 1.5, pb: 1.5 }}>
+                      Previous outputs list here — tap to play above
+                    </Typography>
+                  ) : (
+                    outputFiles.map(file => {
+                      const meta = outputMeta[file.name];
+                      const isActive = activeOutputName === file.name;
+                      const durationLabel = meta?.audioSec != null ? formatDuration(meta.audioSec) : null;
+                      return (
+                        <Box
+                          key={file.name}
+                          onClick={() => selectOutputFile(file.name)}
+                          sx={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 1,
+                            px: 1.25,
+                            py: 0.85,
+                            cursor: "pointer",
+                            bgcolor: isActive ? "action.selected" : "transparent",
+                            borderLeft: "3px solid",
+                            borderLeftColor: isActive ? "primary.main" : "transparent",
+                            "&:hover": { bgcolor: "action.hover" }
+                          }}
+                        >
+                          <Box
+                            sx={{
+                              width: 26,
+                              height: 26,
+                              borderRadius: "50%",
+                              flexShrink: 0,
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "center",
+                              bgcolor: isActive ? "primary.main" : "transparent",
+                              color: isActive ? "primary.contrastText" : "text.secondary",
+                              border: "1px solid",
+                              borderColor: isActive ? "primary.main" : "divider"
+                            }}
+                          >
+                            <i className="ri-play-fill" style={{ fontSize: 12, marginLeft: 1 }} />
+                          </Box>
+                          <Box sx={{ flex: 1, minWidth: 0 }}>
+                            <Typography variant="body2" sx={{ fontWeight: isActive ? 700 : 500, fontSize: "0.8rem" }} noWrap>
+                              {historyRowTitle(file)}
+                            </Typography>
+                            {meta?.genSec != null && (
+                              <Typography variant="caption" color="text.secondary" noWrap>
+                                Rendered in {formatDuration(meta.genSec)}
+                              </Typography>
+                            )}
+                          </Box>
+                          {durationLabel && (
+                            <Chip label={durationLabel} size="small" variant="outlined" sx={{ height: 22, fontSize: "0.65rem", flexShrink: 0 }} />
+                          )}
+                          <IconButton
+                            size="small"
+                            aria-label="Remove"
+                            onClick={e => {
+                              e.stopPropagation();
+                              setDeleteOneOutputName(file.name);
+                            }}
+                            sx={{ color: "text.disabled", "&:hover": { color: "error.main" } }}
+                          >
+                            <i className="ri-close-line" style={{ fontSize: 16 }} />
+                          </IconButton>
+                        </Box>
+                      );
+                    })
+                  )}
+                </Box>
               </Box>
 
               {lastAudioFile && (
-                <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
-                  <Button variant="outlined" size="small" onClick={handleUseLastForNext}>
-                    Use for next synthesis
+                <Box sx={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 1 }}>
+                  <Button
+                    variant="outlined"
+                    size="small"
+                    onClick={handleUseLastForNext}
+                    startIcon={<i className="ri-repeat-line" />}
+                    sx={{
+                      borderRadius: 1.5,
+                      minHeight: 36,
+                      textTransform: "none",
+                      fontWeight: 600,
+                      fontSize: "0.8rem"
+                    }}
+                  >
+                    Reuse voice
                   </Button>
                   <Button
                     variant="outlined"
                     size="small"
                     color="secondary"
                     onClick={() => setShowSaveLast(v => !v)}
+                    startIcon={<i className="ri-save-3-line" />}
+                    sx={{
+                      borderRadius: 1.5,
+                      minHeight: 36,
+                      textTransform: "none",
+                      fontWeight: 600,
+                      fontSize: "0.8rem"
+                    }}
                   >
-                    {showSaveLast ? "Cancel save" : "Save output to library"}
+                    {showSaveLast ? "Cancel" : "Save voice"}
                   </Button>
                   {showSaveLast && (
                     <Box sx={{ mt: 1, p: 2, bgcolor: "action.hover", borderRadius: 2 }}>
@@ -1063,6 +1318,53 @@ export default function VoxCPMStudio() {
                     </Box>
                   )}
                 </Box>
+              )}
+
+              <Button
+                size="small"
+                fullWidth
+                onClick={() => setShowOutputDetails(v => !v)}
+                endIcon={<i className={showOutputDetails ? "ri-arrow-up-s-line" : "ri-arrow-down-s-line"} />}
+                sx={{ mb: 1, textTransform: "none", color: "text.secondary", fontWeight: 600 }}
+              >
+                {showOutputDetails ? "Hide" : "Show"} process log
+              </Button>
+              {showOutputDetails && (
+                <>
+                  <Box
+                    ref={logBoxRef}
+                    sx={{
+                      mb: 1,
+                      maxHeight: 120,
+                      overflowY: "auto",
+                      bgcolor: "background.default",
+                      borderRadius: 2,
+                      p: 1.25,
+                      fontFamily: "ui-monospace, Menlo, Monaco, Consolas, monospace",
+                      fontSize: "0.7rem",
+                      border: "1px solid",
+                      borderColor: "divider"
+                    }}
+                  >
+                    {logs.length === 0 ? (
+                      <Typography variant="caption" color="text.secondary">
+                        {loading ? "Waiting for server…" : "No logs yet"}
+                      </Typography>
+                    ) : (
+                      logs.map((line, i) => <Box key={i}>{line}</Box>)
+                    )}
+                  </Box>
+                  {synthesisPlan && (
+                    <Box sx={{ mb: 1, p: 1.25, borderRadius: 2, bgcolor: "action.hover", maxHeight: 120, overflowY: "auto" }}>
+                      <Typography variant="caption" sx={{ fontWeight: 700, display: "block", mb: 0.5 }}>
+                        Synthesis plan
+                      </Typography>
+                      <Typography variant="caption" component="pre" sx={{ m: 0, whiteSpace: "pre-wrap", color: "text.secondary" }}>
+                        {synthesisPlan}
+                      </Typography>
+                    </Box>
+                  )}
+                </>
               )}
 
             </CardContent>
@@ -1215,6 +1517,34 @@ export default function VoxCPMStudio() {
         </Grid>
       </Grid>
       <Dialog
+        open={Boolean(deleteOneOutputName)}
+        onClose={() => setDeleteOneOutputName(null)}
+        aria-labelledby="delete-one-output-title"
+      >
+        <DialogTitle id="delete-one-output-title">Remove this audio?</DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            {deleteOneOutputName ? `Delete ${deleteOneOutputName} from history?` : ""}
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setDeleteOneOutputName(null)} color="inherit">
+            Cancel
+          </Button>
+          <Button
+            color="error"
+            variant="contained"
+            onClick={async () => {
+              const name = deleteOneOutputName;
+              setDeleteOneOutputName(null);
+              if (name) await handleDeleteOneOutput(name);
+            }}
+          >
+            Remove
+          </Button>
+        </DialogActions>
+      </Dialog>
+      <Dialog
         open={deleteOutputsDialogOpen}
         onClose={() => setDeleteOutputsDialogOpen(false)}
         aria-labelledby="delete-generated-audio-title"
@@ -1238,6 +1568,52 @@ export default function VoxCPMStudio() {
             }}
           >
             Delete all
+          </Button>
+        </DialogActions>
+      </Dialog>
+      <Dialog
+        open={showUpgradeDialog}
+        onClose={() => setShowUpgradeDialog(false)}
+        aria-labelledby="upgrade-dialog-title"
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle id="upgrade-dialog-title" sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+          <Box component="span" sx={{ fontSize: "1.5rem" }}>🔒</Box>
+          Chunk Limit Reached
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText sx={{ mb: 2 }}>
+            Your current license allows a maximum of <strong>{licenseMaxChunks}</strong> chunks per synthesis request,
+            but your text requires approximately <strong>{estimatedChunks}</strong> chunks.
+          </DialogContentText>
+          <Alert severity="info" sx={{ mb: 2 }}>
+            Each chunk is approximately {licenseChunkChars} characters. To process longer texts, you need a license with a higher chunk limit (up to 1,000).
+          </Alert>
+          <DialogContentText>
+            <strong>What you can do:</strong>
+          </DialogContentText>
+          <Box component="ul" sx={{ mt: 1, pl: 3 }}>
+            <li>
+              <Typography variant="body2" sx={{ mb: 0.5 }}>
+                <strong>Shorten the text</strong> — remove content to bring it under {licenseMaxChunks} chunks
+              </Typography>
+            </li>
+            <li>
+              <Typography variant="body2" sx={{ mb: 0.5 }}>
+                <strong>Use Batch mode</strong> — split into separate requests in the Batch & Queue panel
+              </Typography>
+            </li>
+            <li>
+              <Typography variant="body2">
+                <strong>Upgrade your license</strong> — contact your administrator for a higher chunk limit
+              </Typography>
+            </li>
+          </Box>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setShowUpgradeDialog(false)} color="inherit">
+            Close
           </Button>
         </DialogActions>
       </Dialog>

@@ -476,6 +476,8 @@ def build_ui() -> None:
                                     ui.label("Not activated").classes("studio-subtitle")
                             if status.ok and status.expires:
                                 ui.label(f"Exp. {status.expires}").classes("text-caption text-grey")
+                            if status.ok and status.max_chunks is not None:
+                                ui.label(f"Max chunks: {status.max_chunks} per request").classes("text-caption text-grey")
                             ui.label(f"Machine ID: {machine_id[:10]}...").classes("text-caption text-grey")
                         with ui.row().classes("items-center gap-0"):
                             ui.button("License", icon="vpn_key", on_click=license_dialog.open).props(

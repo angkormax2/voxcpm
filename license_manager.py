@@ -38,6 +38,7 @@ class LicenseStatus:
     remaining_label: str | None = None
     remaining_days: int | None = None
     remaining_hours: int | None = None
+    max_chunks: int | None = None
 
 
 def license_expiry_end(expires: str) -> datetime:
@@ -224,6 +225,7 @@ def verify_signed_license(token: str, *, machine_id: str | None = None) -> Licen
         return LicenseStatus(False, f"License expired on {exp_date.isoformat()}.")
 
     source = str(payload.get("src", "offline"))
+    mc = payload.get("mc", 50)
     status = LicenseStatus(
         True,
         f"Licensed until {exp_date.isoformat()} ({source}).",
@@ -231,6 +233,7 @@ def verify_signed_license(token: str, *, machine_id: str | None = None) -> Licen
         machine_id=current,
         license_id=str(payload.get("lid", "")),
         source=source,
+        max_chunks=int(mc) if mc is not None else 50,
     )
     return _with_remaining(status)
 

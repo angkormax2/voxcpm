@@ -10,6 +10,8 @@ data/license_admin_config.json
 data/license_issued_log.json
 data/bin/
 data/generated_audio/
+data/dubbing/
+data/studio_settings.json
 app_local.py
 .venv/
 starter-kit/node_modules/

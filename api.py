@@ -36,7 +36,7 @@ import soundfile as sf
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from speaking_styles import SPEAKING_STYLE_CHOICES, get_style_control
@@ -102,7 +102,7 @@ app.add_middleware(
 demo = VoxCPMDemo(model_id=DEFAULT_MODEL_ID)
 OUTPUT_DIR = Path("data") / "generated_audio"
 MAX_TTS_CHUNK_CHARS = 260
-MAX_TTS_CHUNKS = 80
+DEFAULT_MAX_CHUNKS = 50
 CHUNK_PAUSE_SECONDS = 0.12
 AUTO_FALLBACK_STYLE_BY_SPEAKER = {
     "male": "neutral",
@@ -134,6 +134,17 @@ def _list_output_files() -> list[dict[str, object]]:
             }
         )
     return files
+
+
+def _safe_output_path(name: str) -> Path:
+    clean = (name or "").strip()
+    if not clean or clean != Path(clean).name or ".." in clean:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    folder = _ensure_output_dir().resolve()
+    path = (folder / clean).resolve()
+    if path.parent != folder:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    return path
 
 
 def _split_long_text_for_tts(text: str, max_chars: int = MAX_TTS_CHUNK_CHARS) -> list[str]:
@@ -225,9 +236,31 @@ class GenerateRequest(BaseModel):
     prompt_text: str = ""
 
 
+def _get_license_max_chunks() -> int:
+    """Read max_chunks from the active license token (defaults to DEFAULT_MAX_CHUNKS)."""
+    try:
+        from license_manager import current_license_status
+        status = current_license_status()
+        if status.ok and status.max_chunks is not None:
+            return status.max_chunks
+    except Exception:
+        pass
+    return DEFAULT_MAX_CHUNKS
+
+
 @app.get("/api/health")
 def health_check():
     return {"status": "ok", "device": demo.device}
+
+
+@app.get("/api/license-limits")
+def get_license_limits():
+    max_chunks = _get_license_max_chunks()
+    return {
+        "max_chunks": max_chunks,
+        "warning_threshold": max(1, max_chunks // 2),
+        "chunk_chars": MAX_TTS_CHUNK_CHARS,
+    }
 
 
 @app.get("/api/voices")
@@ -307,6 +340,26 @@ def open_outputs_folder():
         return {"status": "success", "folder": str(folder)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not open folder: {e}")
+
+
+@app.get("/api/outputs/file/{filename}")
+def get_output_file(filename: str):
+    path = _safe_output_path(filename)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path, media_type="audio/wav", filename=path.name)
+
+
+@app.delete("/api/outputs/file/{filename}")
+def delete_output_file(filename: str):
+    path = _safe_output_path(filename)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    try:
+        path.unlink()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not delete file: {e}")
+    return {"status": "success", "deleted": filename}
 
 
 @app.delete("/api/outputs")
@@ -463,11 +516,41 @@ def generate_audio(
                 plan_lines.append(f"Timesteps: {timesteps} | CFG: {cfg_value}")
                 log_queue.put({"type": "plan", "plan": "\n".join(plan_lines)})
 
-                if len(text_chunks) > MAX_TTS_CHUNKS:
+
+                # --- License-based chunk limit ---
+                license_max = _get_license_max_chunks()
+                warning_threshold = max(1, license_max // 2)
+                num_chunks = len(text_chunks)
+
+                if num_chunks > license_max:
+                    log_queue.put({
+                        "type": "chunk_limit",
+                        "chunks": num_chunks,
+                        "max_chunks": license_max,
+                        "message": (
+                            f"Text requires {num_chunks} chunks but your license allows "
+                            f"a maximum of {license_max} chunks per request. "
+                            f"Please shorten the text or contact your administrator to upgrade."
+                        ),
+                    })
                     raise RuntimeError(
-                        f"Text is too long for one request ({len(text_chunks)} chunks). "
-                        f"Please shorten it or use batch mode."
+                        f"Text requires {num_chunks} chunks but your license allows "
+                        f"a maximum of {license_max} chunks per request. "
+                        f"Please shorten the text or contact your administrator to upgrade."
                     )
+
+                if num_chunks > warning_threshold:
+                    warn_msg = (
+                        f"⚠️ Long text detected ({num_chunks}/{license_max} chunks). "
+                        f"Processing may take several minutes and use significant GPU memory."
+                    )
+                    log.add(warn_msg)
+                    log_queue.put({
+                        "type": "chunk_warning",
+                        "chunks": num_chunks,
+                        "max_chunks": license_max,
+                        "message": warn_msg,
+                    })
 
                 if len(text_chunks) > 1:
                     log.add(

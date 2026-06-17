@@ -83,7 +83,7 @@ const HorizontalMenu = () => {
         }}
       >
         <MenuItem href='/home' icon={<i className='ri-mic-line' />}>
-          Feature
+          Voice
         </MenuItem>
         <MenuItem href='/help' icon={<i className='ri-book-open-line' />}>
           Help
