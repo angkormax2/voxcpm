@@ -1030,7 +1030,7 @@ def run_checks() -> list[CheckResult]:
     if venv_ok:
         try:
             subprocess.check_call(
-                [str(VENV_PYTHON), "-c", "import voxcpm"],
+                [str(VENV_PYTHON), "-c", "import voxcpm; import cryptography"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 **hide,
