@@ -1164,10 +1164,16 @@ class StudioManager:
         if proc is None or proc.poll() is not None:
             return
         try:
-            proc.terminate()
-            proc.wait(timeout=6)
+            if sys.platform == "win32":
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, **_subprocess_hide_kwargs())
+            else:
+                proc.terminate()
+                proc.wait(timeout=6)
         except Exception:
-            proc.kill()
+            try:
+                proc.kill()
+            except Exception:
+                pass
         self.log(f"Stopped {name}.")
 
     def log(self, msg: str) -> None:
@@ -1194,7 +1200,7 @@ class StudioManager:
                     if f":{port} " in line and "LISTENING" in line:
                         pid = line.split()[-1]
                         subprocess.run(
-                            ["taskkill", "/F", "/PID", pid],
+                            ["taskkill", "/F", "/T", "/PID", pid],
                             capture_output=True,
                             **_subprocess_hide_kwargs(),
                         )

@@ -197,7 +197,7 @@ def _run_tk_fallback(reason: str) -> None:
 def _ensure_nicegui() -> bool:
     try:
         import nicegui  # noqa: F401
-
+        import cryptography  # noqa: F401
         return True
     except ImportError:
         pass
@@ -205,11 +205,12 @@ def _ensure_nicegui() -> bool:
         import subprocess
 
         subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "nicegui>=2.0.0", "pywebview>=5.0", "-q"],
+            [sys.executable, "-m", "pip", "install", "nicegui>=2.0.0", "pywebview>=5.0", "cryptography>=42.0.0", "-q"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         import nicegui  # noqa: F401
+        import cryptography  # noqa: F401
 
         return True
     except Exception:

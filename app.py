@@ -1197,9 +1197,10 @@ def create_demo_interface(demo: VoxCPMDemo):
                     log.add(f"Synthesizing… step {step}/{total}")
                     last_logged_step = step
 
-            wav_np = None
+            wav_chunks = []
+            sr = model.tts_model.sample_rate if hasattr(model, 'tts_model') else 24000
             for item in model.generate_with_status(
-                **generate_kwargs, progress_callback=on_synthesis_progress
+                **generate_kwargs, streaming=True, progress_callback=on_synthesis_progress
             ):
                 if isinstance(item, dict) and item.get("kind") == "status":
                     msg = item["message"]
@@ -1207,20 +1208,21 @@ def create_demo_interface(demo: VoxCPMDemo):
                     on_status(msg)
                     yield None, synthesis_plan, log.text(), msg
                 else:
-                    wav_np = item
+                    chunk_np = item
+                    wav_chunks.append(chunk_np)
+                    yield (sr, chunk_np), synthesis_plan, log.text(), progress_state["text"]
 
-            if wav_np is None:
+            if wav_chunks:
+                wav_np = np.concatenate(wav_chunks)
+            else:
                 wav_np = np.array([], dtype=np.float32)
 
-            log.add("Decoding audio (48 kHz)…")
-            yield None, synthesis_plan, log.text(), "⏳ Finalizing audio…"
-
-            sr = model.tts_model.sample_rate
+            log.add("Audio generation finished.")
             duration = len(wav_np) / sr if sr else 0.0
             log.add(f"Done — duration {duration:.2f}s, sample rate {sr} Hz")
             progress(1.0, desc="Complete")
             final_status = progress_state["text"] or "✅ Complete"
-            yield (sr, wav_np), synthesis_plan, log.text(), final_status
+            yield (sr, np.array([], dtype=np.float32)), synthesis_plan, log.text(), final_status
         except Exception as exc:
             log.add(f"Failed: {exc}")
             yield None, keep_preview, log.text(), f"❌ {exc}"
@@ -1459,7 +1461,7 @@ def create_demo_interface(demo: VoxCPMDemo):
             with gr.Column(scale=5):
                 with gr.Group(elem_classes=["vox-output-card"]):
                     gr.HTML('<div class="vox-card-title">🔊 Output</div>')
-                    audio_output = gr.Audio(label=I18N("generated_audio_label"))
+                    audio_output = gr.Audio(label=I18N("generated_audio_label"), streaming=True, autoplay=True)
                     progress_status = gr.Markdown(
                         "Ready — click **Generate Speech** to start.",
                         elem_id="progress-status",

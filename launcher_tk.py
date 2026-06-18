@@ -1002,7 +1002,23 @@ class StudioLauncherApp:
         self.root.mainloop()
 
 
+def _ensure_cryptography() -> None:
+    try:
+        import cryptography  # noqa: F401
+    except ImportError:
+        try:
+            import subprocess
+            import sys
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "cryptography>=42.0.0", "-q"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
 def main() -> None:
+    _ensure_cryptography()
     StudioLauncherApp().run()
 
 

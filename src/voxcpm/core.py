@@ -457,11 +457,14 @@ class VoxCPM:
 
                 if streaming:
                     try:
-                        for wav, _, _ in generate_result:
+                        for wav in generate_result:
                             yield wav.squeeze(0).cpu().numpy()
                     finally:
                         generate_result.close()
-                    return
+                    
+                    if chunk_idx < n_chunks - 1 and pause_samples > 0:
+                        yield np.zeros(pause_samples, dtype=np.float32)
+                    continue
 
                 wav, _, pred_audio_feat = next_and_close(generate_result)
                 segment = wav.squeeze(0).cpu().numpy()
