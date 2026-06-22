@@ -4,6 +4,7 @@ import re
 import json
 import tempfile
 import numpy as np
+import torch
 from typing import Callable, Generator, Optional, Union
 from huggingface_hub import snapshot_download
 from .model.voxcpm import VoxCPMModel, LoRAConfig
@@ -15,6 +16,13 @@ from .paths import resolve_default_voxcpm2_path
 MAX_SINGLE_PASS_TARGET_TOKENS = 50
 MAX_CHUNK_TARGET_TOKENS = 45
 CHUNK_PAUSE_SEC = 0.15
+
+
+def _seed_everything(seed: int) -> None:
+    """Make the diffusion noise deterministic so a designed speaker is reproducible."""
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def _parse_control_prefix(text: str) -> tuple[str, str]:
@@ -189,7 +197,11 @@ class VoxCPM:
         return len(self.tts_model.text_tokenizer(text))
 
     def _preprocess_target_text(self, text: str, normalize: bool) -> str:
-        from .utils.text_normalize import clean_text, detect_tts_language
+        from .utils.text_normalize import (
+            clean_text,
+            detect_tts_language,
+            remove_unspeakable_symbols,
+        )
 
         text = clean_text(text.replace("\n", " "))
         text = re.sub(r"\s+", " ", text).strip()
@@ -202,6 +214,9 @@ class VoxCPM:
                     tokenizer=self.tts_model.text_tokenizer.tokenizer
                 )
             text = self.text_normalizer.normalize(text, split=False)
+        # Strip signs the model can't voice (៖, *, #, …) and collapse "?....".
+        # Runs last so it never interferes with zh/en symbol normalization.
+        text = remove_unspeakable_symbols(text)
         return text
 
     def _split_long_target_text(self, text: str) -> list[str]:
@@ -276,7 +291,7 @@ class VoxCPM:
         self, *args, **kwargs
     ) -> Generator[Union[dict, np.ndarray], None, None]:
         """Like generate() but yields ``{'kind':'status','message':...}`` before the final waveform."""
-        return self._generate(*args, streaming=False, **kwargs)
+        return self._generate(*args, **kwargs)
 
     def generate_streaming(self, *args, **kwargs) -> Generator[np.ndarray, None, None]:
         return self._generate(*args, streaming=True, **kwargs)
@@ -299,6 +314,7 @@ class VoxCPM:
         streaming: bool = False,
         progress_callback=None,
         status_callback: Callable[[str], None] | None = None,
+        seed: Optional[int] = None,
     ) -> Generator[Union[dict, np.ndarray], None, None]:
         """Synthesize speech for the given text and return a single waveform.
 
@@ -321,6 +337,8 @@ class VoxCPM:
             retry_badcase_max_times: Maximum number of times to retry badcase.
             retry_badcase_ratio_threshold: Threshold for audio-to-text ratio.
             streaming: Whether to return a generator of audio chunks.
+            seed: Fixed random seed for reproducible voice identity (designed
+                speakers). If ``None``, a fresh random voice is produced each call.
         Returns:
             Generator of numpy.ndarray: 1D waveform array (float32) on CPU.
             Yields audio chunks for each generation step if ``streaming=True``,
@@ -441,6 +459,12 @@ class VoxCPM:
 
                 prompt_for_chunk = rolling_cache if use_voice_continuation else fixed_prompt_cache
 
+                # Lock the diffusion noise so a chosen speaker is reproducible.
+                # Derive a per-segment seed so chained segments still vary naturally
+                # while staying fully deterministic for the whole utterance.
+                if seed is not None:
+                    _seed_everything(int(seed) + chunk_idx)
+
                 generate_result = self.tts_model._generate_with_prompt_cache(
                     target_text=chunk_text,
                     prompt_cache=prompt_for_chunk,
@@ -457,11 +481,25 @@ class VoxCPM:
 
                 if streaming:
                     try:
-                        for wav in generate_result:
+                        last_pred_audio_feat = None
+                        for wav, _, pred_audio_feat in generate_result:
                             yield wav.squeeze(0).cpu().numpy()
+                            last_pred_audio_feat = pred_audio_feat
                     finally:
                         generate_result.close()
-                    
+
+                    if (
+                        use_voice_continuation
+                        and chunk_idx < n_chunks - 1
+                        and last_pred_audio_feat is not None
+                        and isinstance(self.tts_model, VoxCPM2Model)
+                    ):
+                        rolling_cache = self.tts_model.merge_prompt_cache(
+                            rolling_cache,
+                            chunk_text,
+                            last_pred_audio_feat,
+                        )
+
                     if chunk_idx < n_chunks - 1 and pause_samples > 0:
                         yield np.zeros(pause_samples, dtype=np.float32)
                     continue

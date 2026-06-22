@@ -42,7 +42,6 @@ _patch_windows_asyncio()
 import voxcpm
 from voxcpm.paths import resolve_default_voxcpm2_path
 from voxcpm.utils.text_normalize import contains_khmer, detect_tts_language
-from speaking_styles import SPEAKING_STYLE_CHOICES, get_style_control
 from voice_profiles import (
     delete_profile,
     get_profile,
@@ -52,10 +51,14 @@ from voice_profiles import (
 )
 from voice_choices import (
     VOICE_CHOOSE,
+    build_style_dropdown_choices,
     build_voice_dropdown_choices,
-    choice_to_speaking_style_key,
     resolve_voice_for_synthesis,
     voice_inventory_summary,
+)
+from speaker_bank import (
+    DEFAULT_SPEAKER_ID,
+    get_speaker,
 )
 
 DEFAULT_MODEL_ID = resolve_default_voxcpm2_path(Path(__file__).parent)
@@ -915,6 +918,7 @@ class VoxCPMDemo:
         do_normalize: bool,
         denoise: bool,
         inference_timesteps: int = 10,
+        seed: Optional[int] = None,
     ) -> dict:
         generate_kwargs = dict(
             text=final_text,
@@ -923,6 +927,7 @@ class VoxCPMDemo:
             inference_timesteps=inference_timesteps,
             normalize=do_normalize,
             denoise=denoise,
+            seed=seed,
         )
         if prompt_text_clean and audio_path:
             generate_kwargs["prompt_wav_path"] = audio_path
@@ -939,6 +944,7 @@ class VoxCPMDemo:
         do_normalize: bool = True,
         denoise: bool = True,
         inference_timesteps: int = 10,
+        seed: Optional[int] = None,
         log: Optional[ProcessLog] = None,
     ) -> Tuple[voxcpm.VoxCPM, dict, str, list[str]]:
         """Load model, build kwargs, and return synthesis plan before audio generation."""
@@ -949,6 +955,14 @@ class VoxCPMDemo:
         text = (text_input or "").strip()
         if len(text) == 0:
             raise ValueError("Please input text to synthesize.")
+
+        from voxcpm.utils.text_normalize import has_speakable_content
+
+        if not has_speakable_content(text):
+            raise ValueError(
+                "Text has no speakable characters (only symbols/punctuation). "
+                "Please enter words to synthesize."
+            )
 
         control = (control_instruction or "").strip()
         control = re.sub(r"[()（）]", "", control).strip()
@@ -984,6 +998,7 @@ class VoxCPMDemo:
             do_normalize=do_normalize,
             denoise=denoise,
             inference_timesteps=inference_timesteps,
+            seed=seed,
         )
 
         segments = current_model.prepare_synthesis_segments(final_text, normalize=do_normalize)
@@ -1005,6 +1020,10 @@ class VoxCPMDemo:
             log.add(f"Target: {preview}")
             if len(segments) > 1:
                 log.add(f"Long text -> {len(segments)} segments (listed in preview panel).")
+            if seed is None:
+                log.add("Voice: random (new voice each generation).")
+            else:
+                log.add(f"Voice: locked (seed {seed}) — reproducible.")
             log.add(f"LocDiT steps: {inference_timesteps}, CFG: {cfg_value_input}")
             log.add("Ready to synthesize — see numbered lines in the preview panel.")
 
@@ -1076,6 +1095,7 @@ class VoxCPMDemo:
         do_normalize: bool = True,
         denoise: bool = True,
         inference_timesteps: int = 10,
+        seed: Optional[int] = None,
         log: Optional[ProcessLog] = None,
         progress: Optional[Callable[[float, str], None]] = None,
     ) -> Tuple[int, np.ndarray, str]:
@@ -1088,6 +1108,7 @@ class VoxCPMDemo:
             do_normalize=do_normalize,
             denoise=denoise,
             inference_timesteps=inference_timesteps,
+            seed=seed,
             log=log,
         )
         sr, wav = self.run_tts_synthesis(
@@ -1124,6 +1145,7 @@ def create_demo_interface(demo: VoxCPMDemo):
     def _generate(
         text: str,
         voice_choice: str,
+        style_choice: str,
         control_instruction: str,
         ref_wav: Optional[str],
         use_prompt_text: bool,
@@ -1132,6 +1154,8 @@ def create_demo_interface(demo: VoxCPMDemo):
         do_normalize: bool,
         denoise: bool,
         dit_steps: int,
+        random_voice: bool,
+        seed_input: float,
         progress=gr.Progress(),
     ):
         """Stream updates to audio / synthesis preview / log separately."""
@@ -1142,17 +1166,39 @@ def create_demo_interface(demo: VoxCPMDemo):
             yield None, keep_preview, log.text(), "⏳ Starting…"
 
             actual_prompt_text = prompt_text_value.strip() if use_prompt_text else ""
-            effective_ref, actual_control = resolve_voice_for_synthesis(
+            effective_ref, actual_control, voice_seed = resolve_voice_for_synthesis(
                 voice_choice,
                 ref_wav,
                 control_instruction,
+                style_choice,
                 use_prompt_text=use_prompt_text,
             )
+
+            # Seed precedence: random toggle wins, then a manual seed, then the
+            # voice's own seed (designed speaker or house default).
+            if random_voice:
+                effective_seed = None
+            else:
+                manual_seed = int(seed_input) if seed_input and int(seed_input) > 0 else None
+                effective_seed = manual_seed if manual_seed is not None else voice_seed
 
             if not (text or "").strip():
                 log.add("Error: Target Text is empty.")
                 yield None, keep_preview, log.text(), "❌ No text"
                 raise ValueError("Please input text to synthesize.")
+
+            # Friendly summary of what's producing this voice.
+            if voice_choice and voice_choice.startswith("designed:"):
+                _sp = get_speaker(voice_choice[len("designed:"):])
+                voice_label = f"{_sp['name']} ({_sp['gender']})" if _sp else voice_choice
+            elif voice_choice and voice_choice.startswith("saved:"):
+                voice_label = "saved clone"
+            elif effective_ref:
+                voice_label = "reference clone"
+            else:
+                voice_label = "voice design"
+            style_label = style_choice if style_choice and style_choice != "custom" else "none"
+            log.add(f"Voice: {voice_label} · Style: {style_label}")
 
             log.add("Validating inputs…")
             yield None, keep_preview, log.text(), "⏳ Validating…"
@@ -1175,6 +1221,7 @@ def create_demo_interface(demo: VoxCPMDemo):
                 do_normalize=do_normalize,
                 denoise=denoise,
                 inference_timesteps=int(dit_steps),
+                seed=effective_seed,
                 log=log,
             )
             # Show segment list in preview only (not duplicated on audio/log panels).
@@ -1197,10 +1244,14 @@ def create_demo_interface(demo: VoxCPMDemo):
                     log.add(f"Synthesizing… step {step}/{total}")
                     last_logged_step = step
 
-            wav_chunks = []
+            # Assemble the full waveform server-side in guaranteed order. We do NOT
+            # stream chunks to the browser: client-side streaming reassembly can
+            # reorder/overlap adjacent segments ("1 2 4 3"). core.generate stitches
+            # the segments in strict order, so the single final audio is correct.
             sr = model.tts_model.sample_rate if hasattr(model, 'tts_model') else 24000
+            final_wav = None
             for item in model.generate_with_status(
-                **generate_kwargs, streaming=True, progress_callback=on_synthesis_progress
+                **generate_kwargs, progress_callback=on_synthesis_progress
             ):
                 if isinstance(item, dict) and item.get("kind") == "status":
                     msg = item["message"]
@@ -1208,21 +1259,18 @@ def create_demo_interface(demo: VoxCPMDemo):
                     on_status(msg)
                     yield None, synthesis_plan, log.text(), msg
                 else:
-                    chunk_np = item
-                    wav_chunks.append(chunk_np)
-                    yield (sr, chunk_np), synthesis_plan, log.text(), progress_state["text"]
+                    # The complete, correctly-ordered waveform (last item yielded).
+                    final_wav = item
 
-            if wav_chunks:
-                wav_np = np.concatenate(wav_chunks)
-            else:
-                wav_np = np.array([], dtype=np.float32)
+            if final_wav is None:
+                final_wav = np.array([], dtype=np.float32)
 
             log.add("Audio generation finished.")
-            duration = len(wav_np) / sr if sr else 0.0
+            duration = len(final_wav) / sr if sr else 0.0
             log.add(f"Done — duration {duration:.2f}s, sample rate {sr} Hz")
             progress(1.0, desc="Complete")
             final_status = progress_state["text"] or "✅ Complete"
-            yield (sr, np.array([], dtype=np.float32)), synthesis_plan, log.text(), final_status
+            yield (sr, final_wav), synthesis_plan, log.text(), final_status
         except Exception as exc:
             log.add(f"Failed: {exc}")
             yield None, keep_preview, log.text(), f"❌ {exc}"
@@ -1243,13 +1291,15 @@ def create_demo_interface(demo: VoxCPMDemo):
         )
 
     def _on_voice_select(voice_choice: str, uploaded_path: Optional[str], ultimate_mode: bool):
+        """Pick WHO speaks. Delivery style lives in its own dropdown; the Control
+        Instruction box is for free-text notes and is never auto-overwritten here."""
         if ultimate_mode:
             return gr.update(), gr.update(), ""
         if not voice_choice or voice_choice == VOICE_CHOOSE:
             return (
                 gr.update(),
                 gr.update(interactive=True),
-                "No voice selected — upload **Reference audio** or pick a built-in / saved voice.",
+                "No voice selected — upload **Reference audio** or pick a designed speaker / saved voice.",
             )
         if voice_choice.startswith("saved:"):
             profile_id = voice_choice[6:]
@@ -1261,28 +1311,29 @@ def create_demo_interface(demo: VoxCPMDemo):
                     "⚠️ Saved audio file missing. Re-save this voice.",
                 )
             profile = get_profile(profile_id) or {}
-            style = profile.get("speaking_style", "custom")
-            ctrl = get_style_control(style) if style and style != "custom" else ""
             msg = f"Saved clone **{profile.get('name', '')}** ({profile.get('gender', '')})."
             transcript = (profile.get("transcript") or "").strip()
             if transcript:
                 msg += f" Transcript on file ({len(transcript)} chars)."
-            return gr.update(value=path), gr.update(value=ctrl, interactive=style == "custom"), msg
-        if voice_choice.startswith("preset:"):
-            key = voice_choice[7:]
-            ctrl = get_style_control(key) if key != "custom" else ""
-            label = dict(SPEAKING_STYLE_CHOICES).get(key, key)
-            return (
-                gr.update(),
-                gr.update(value=ctrl, interactive=key == "custom"),
-                f"Built-in voice: **{label}** — no reference file needed.",
+            msg += " Steer delivery with **Speaking style**."
+            return gr.update(value=path), gr.update(interactive=True), msg
+        if voice_choice.startswith("designed:"):
+            speaker = get_speaker(voice_choice[len("designed:"):])
+            if not speaker:
+                return gr.update(), gr.update(interactive=True), ""
+            msg = (
+                f"Designed speaker: **{speaker['name']}** "
+                f"({speaker['gender']}, {speaker['tag']}) — consistent voice, no "
+                "reference file. Choose a delivery in **Speaking style** (e.g. "
+                "Reading news) for a professional read."
             )
+            return gr.update(), gr.update(interactive=True), msg
         return gr.update(), gr.update(interactive=True), ""
 
-    def _on_save_voice(name, gender, voice_choice, uploaded_path, prompt_text_val, use_prompt):
+    def _on_save_voice(name, gender, style_choice, uploaded_path, prompt_text_val, use_prompt):
         try:
             transcript_val = prompt_text_val.strip() if use_prompt else ""
-            style_key = choice_to_speaking_style_key(voice_choice)
+            style_key = style_choice if style_choice else "custom"
             profile_id, msg = save_profile(
                 name=name,
                 audio_path=uploaded_path or "",
@@ -1348,7 +1399,7 @@ def create_demo_interface(demo: VoxCPMDemo):
                     gr.HTML('<div class="vox-card-title">🎤 Voice Selection</div>')
                     voice_select = gr.Dropdown(
                         choices=build_voice_dropdown_choices(),
-                        value=VOICE_CHOOSE,
+                        value=f"designed:{DEFAULT_SPEAKER_ID}",
                         label=I18N("voice_select_label"),
                         info=I18N("voice_select_info"),
                     )
@@ -1401,6 +1452,17 @@ def create_demo_interface(demo: VoxCPMDemo):
                 # ── Card: Style & Text ──
                 with gr.Group(elem_classes=["vox-card"]):
                     gr.HTML('<div class="vox-card-title">🎛️ Style & Text</div>')
+                    style_select = gr.Dropdown(
+                        choices=build_style_dropdown_choices(),
+                        value="custom",
+                        label="🎭 Speaking style (how the voice delivers)",
+                        info=(
+                            "Delivery on top of the chosen speaker — e.g. pick "
+                            "speaker 'Sovann' + style 'Reading news' for a "
+                            "professional news read. 'Custom' uses only your "
+                            "Control Instruction below."
+                        ),
+                    )
                     control_instruction = gr.Textbox(
                         value="",
                         label=I18N("control_label"),
@@ -1444,6 +1506,25 @@ def create_demo_interface(demo: VoxCPMDemo):
                             label=I18N("dit_steps_label"),
                             info=I18N("dit_steps_info"),
                         )
+                        random_voice = gr.Checkbox(
+                            value=False,
+                            label="🎲 Random voice each time",
+                            elem_classes=["switch-toggle"],
+                            info=(
+                                "On: a fresh random voice every generation (legacy). "
+                                "Off: the selected speaker / seed stays identical."
+                            ),
+                        )
+                        seed_input = gr.Number(
+                            value=0,
+                            precision=0,
+                            label="Voice seed (0 = use selected speaker)",
+                            info=(
+                                "Lock a specific voice. 0 follows the chosen designed "
+                                "speaker (or the house default). Ignored when Random "
+                                "voice is on."
+                            ),
+                        )
 
                 # ── Generate Button (full-width gradient) ──
                 with gr.Group(elem_classes=["vox-generate-wrap"]):
@@ -1461,7 +1542,7 @@ def create_demo_interface(demo: VoxCPMDemo):
             with gr.Column(scale=5):
                 with gr.Group(elem_classes=["vox-output-card"]):
                     gr.HTML('<div class="vox-card-title">🔊 Output</div>')
-                    audio_output = gr.Audio(label=I18N("generated_audio_label"), streaming=True, autoplay=True)
+                    audio_output = gr.Audio(label=I18N("generated_audio_label"), autoplay=True)
                     progress_status = gr.Markdown(
                         "Ready — click **Generate Speech** to start.",
                         elem_id="progress-status",
@@ -1501,7 +1582,7 @@ def create_demo_interface(demo: VoxCPMDemo):
             inputs=[
                 profile_name,
                 profile_gender,
-                voice_select,
+                style_select,
                 reference_wav,
                 prompt_text,
                 show_prompt_text,
@@ -1530,6 +1611,7 @@ def create_demo_interface(demo: VoxCPMDemo):
             inputs=[
                 text,
                 voice_select,
+                style_select,
                 control_instruction,
                 reference_wav,
                 show_prompt_text,
@@ -1538,6 +1620,8 @@ def create_demo_interface(demo: VoxCPMDemo):
                 DoNormalizeText,
                 DoDenoisePromptAudio,
                 dit_steps,
+                random_voice,
+                seed_input,
             ],
             outputs=[audio_output, synthesis_preview, status_log, progress_status],
             show_progress=False,

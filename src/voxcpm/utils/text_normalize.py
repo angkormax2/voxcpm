@@ -411,6 +411,64 @@ def clean_markdown(md_text: str) -> str:
     return md_text
 
 
+# Signs the TTS model cannot pronounce — they produce wrong/garbled voice or
+# silence. Replaced with a space. Sentence terminators (. , ! ? ; : ។ ៕) and the
+# (control) prefix parentheses are deliberately preserved.
+_UNSPEAKABLE_CHARS = (
+    "៖ៗ៘៙៚៛"            # Khmer decorative / non-lexical signs (keep ។ ៕)
+    "*#^~|\\_=+<>[]{}@`"   # ASCII symbols with no spoken form
+    "§©®™°•·●○■◆◇★☆※‣◦…"  # misc decorative glyphs + ellipsis handled below
+    "→←↑↓⇒⇐↔«»"           # arrows and guillemets
+)
+_UNSPEAKABLE_TABLE = {ord(c): " " for c in _UNSPEAKABLE_CHARS if c != "…"}
+
+
+def _collapse_punct_run(run: str) -> str:
+    """Pick the strongest terminator from a run like '?....' or '!!!'."""
+    if "?" in run:
+        return "?"
+    if "!" in run:
+        return "!"
+    return "."
+
+
+def remove_unspeakable_symbols(text: str) -> str:
+    """Strip signs the TTS model can't voice (e.g. ៖, *, #) and tidy punctuation.
+
+    Should run *after* language-specific normalization so symbol expansion
+    (e.g. Chinese math signs) is left untouched. Sentence terminators and the
+    ``(control)`` prefix parentheses are preserved.
+    """
+    if not text:
+        return text
+    # Ellipsis -> period so the run-collapse below can fold "?…" / "?...." -> "?".
+    text = text.replace("…", ".")
+    text = text.translate(_UNSPEAKABLE_TABLE)
+    # Collapse repeated end punctuation: "?....", "...", "!!!" -> a single mark.
+    text = re.sub(r"[.?!]{2,}", lambda m: _collapse_punct_run(m.group()), text)
+    # Collapse repeated commas / Khmer terminators left by paste or edits.
+    text = re.sub(r",{2,}", ",", text)
+    text = re.sub(r"។{2,}", "។", text)
+    text = re.sub(r"៕{2,}", "៕", text)
+    # Tidy spaces created by the removals: attach a floating mark to the word
+    # before it ("word , word" -> "word, word") so it reads as a natural pause.
+    text = re.sub(r"\s+([.,!?;:])", r"\1", text)
+    # Drop leading orphan punctuation, but never the (control) prefix paren.
+    text = re.sub(r"^[\s,.;:!?]+", "", text)
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    return text
+
+
+# Any letter or number in any script — used to tell speakable text from a paste
+# of only symbols / punctuation (which would make the model emit garbage).
+_SPEAKABLE_RE = regex.compile(r"[\p{L}\p{N}]")
+
+
+def has_speakable_content(text: str) -> bool:
+    """True if the text contains at least one letter or digit to actually voice."""
+    return bool(_SPEAKABLE_RE.search(text or ""))
+
+
 def clean_text(text):
     # 去除 Markdown 语法
     text = clean_markdown(text)

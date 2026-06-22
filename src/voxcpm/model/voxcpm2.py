@@ -746,29 +746,32 @@ class VoxCPM2Model(nn.Module):
         new_audio_feat: torch.Tensor,
     ):
         """
-        Merge original prompt cache with newly generated content to stabilize voice.
+        Build the continuation cache for the next segment.
+
+        Uses a *sliding window of one segment*: the next segment continues from
+        only the most recently generated segment, not the whole accumulated
+        history. Accumulating every prior segment makes the LM re-speak or
+        reorder earlier sentences ("going back to the first / second"); a
+        single-segment window keeps the voice continuous without corrupting
+        sentence order. The original reference (voice-clone anchor), if any, is
+        always preserved.
 
         Args:
             original_cache: original prompt cache (any mode)
-            new_text: newly generated text
-            new_audio_feat: newly generated audio features
+            new_text: the text that was just spoken in the previous segment
+            new_audio_feat: audio features for that previous segment
 
         Returns:
-            merged_cache: merged cache with prompt_text and audio_feat
+            merged_cache: continuation cache carrying only the last segment
         """
-        if original_cache is None:
-            return {
-                "prompt_text": new_text,
-                "audio_feat": new_audio_feat,
-                "mode": "continuation",
-            }
-        merged = {}
-        if "ref_audio_feat" in original_cache:
+        merged = {
+            "prompt_text": new_text,
+            "audio_feat": new_audio_feat,
+            "mode": "continuation",
+        }
+        if original_cache and "ref_audio_feat" in original_cache:
             merged["ref_audio_feat"] = original_cache["ref_audio_feat"]
-        merged["prompt_text"] = original_cache.get("prompt_text", "") + new_text
-        old_feat = original_cache.get("audio_feat", new_audio_feat.new_empty(0, *new_audio_feat.shape[1:]))
-        merged["audio_feat"] = torch.cat([old_feat, new_audio_feat], dim=0)
-        merged["mode"] = "ref_continuation" if "ref_audio_feat" in merged else "continuation"
+            merged["mode"] = "ref_continuation"
         return merged
 
     def generate_with_prompt_cache(self, *args, **kwargs) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
